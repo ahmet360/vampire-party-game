@@ -3,9 +3,11 @@
 const socket = io();
 
 let state = null;
-let lastPhase = null;
 let selectedTransporterTargets = [];
 let joinDetails = null;
+let privateView = false;
+let pendingNightChoice = null;
+let savingTurn = false;
 
 const storedId = localStorage.getItem("vampirePlayerId");
 const playerId = storedId || makePlayerId();
@@ -88,17 +90,26 @@ socket.on("connect", () => {
   if (state?.me && joinDetails) socket.emit("join", joinDetails);
 });
 
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden && privateView) hidePrivateView();
+});
+
 // ##################################### 4
 // Main render function
 function render() {
   if (!state || !state.me) return;
 
-  if (lastPhase !== state.phase) {
-    selectedTransporterTargets = [];
-    lastPhase = state.phase;
-  }
-
   $("join-screen").classList.add("hidden");
+  const atNight = state.phase === "night";
+  $("night-panel").classList.toggle("hidden", !atNight);
+  $("game-screen").classList.toggle("hidden", atNight);
+  if (atNight) {
+    $("app").replaceChildren();
+    renderNightScreen();
+    bindDynamicButtons();
+    return;
+  }
+  $("night-panel").replaceChildren();
   $("game-screen").classList.remove("hidden");
 
   $("top-player-list").innerHTML = renderPlayerList();
@@ -112,6 +123,58 @@ function render() {
   $("role-descriptions").innerHTML = renderRoleDescriptions();
 
   bindDynamicButtons();
+}
+
+function renderNightScreen() {
+  const turn = state.nightTurn;
+  const active = turn ? findPlayer(turn.playerId) : null;
+  const yourTurn = active?.id === state.me.id;
+  const isOpen = yourTurn && privateView && !savingTurn;
+  let heading = "Wait for your turn";
+  if (yourTurn) heading = "It's your turn";
+  if (savingTurn) heading = "Saving your choice…";
+  if (state.me.nightTurnComplete) heading = "Turn complete";
+  if (!state.me.alive) heading = "Watching the game";
+
+  $("night-panel").innerHTML = `
+    <section class="card night-cover">
+      <p class="muted">Night ${state.nightNumber}${turn ? ` · Turn ${turn.number} of ${turn.total}` : ""}</p>
+      <h1>${isOpen ? "Your private turn" : heading}</h1>
+      ${isOpen ? `<button id="hide-private-btn" class="secondary">Cover screen</button>`
+        : `<p>${active ? `${escapeHtml(active.name)}${active.connected ? " is taking their turn." : " is reconnecting."}` : "The night is ending."}</p>
+          ${yourTurn && !savingTurn ? `<button id="show-private-btn" class="primary">Open my turn</button>` : ""}`}
+    </section>
+    ${isOpen ? `${renderRoleCard()}${pendingNightChoice ? renderNightConfirmation() : renderNightActions()}` : ""}
+    ${!isOpen && state.me.isHost ? `
+      <details class="card night-host">
+        <summary>Host controls</summary>
+        <div class="button-grid">
+          <button id="skip-night-btn" class="secondary" ${active ? "" : "disabled"}>Skip current turn</button>
+          <button id="resolve-night-btn" class="secondary">End night early</button>
+          <button id="end-game-btn" class="secondary">End game</button>
+        </div>
+      </details>` : ""}
+  `;
+}
+
+function hidePrivateView() {
+  privateView = false;
+  pendingNightChoice = null;
+  selectedTransporterTargets = [];
+  render();
+}
+
+function renderNightConfirmation() {
+  return `
+    <section class="card action-card">
+      <h2>Lock in your choice?</h2>
+      <p>${escapeHtml(pendingNightChoice.label)}</p>
+      <div class="button-grid">
+        <button id="confirm-night-btn" class="primary">Lock in choice</button>
+        <button id="change-night-btn" class="secondary">Change choice</button>
+      </div>
+    </section>
+  `;
 }
 
 // ##################################### 5
@@ -155,6 +218,7 @@ function renderStatusCard() {
         <span class="badge">${escapeHtml(roundText || `${state.playerCount} player${state.playerCount === 1 ? "" : "s"}`)}</span>
       </div>
       <p class="muted">Alive players: ${state.aliveCount}</p>
+      ${state.phase === "day" ? `<p>${state.votesCast} of ${state.aliveCount} votes in</p>` : ""}
       ${state.phase === "lobby" ? `<p>Waiting for players. The host can configure roles and start the game.</p>` : ""}
       ${state.phase === "gameover" ? renderGameOverSummary() : ""}
     </section>
@@ -164,6 +228,13 @@ function renderStatusCard() {
 function renderRoleCard() {
   const me = state.me;
   const roleText = me.role || "No role yet";
+  if (!me.role) return "";
+  if (!privateView) return `
+    <section class="card role-card">
+      <h2>Role hidden</h2>
+      <button id="show-private-btn" class="secondary">Show role</button>
+    </section>
+  `;
 
   return `
     <section class="card role-card">
@@ -171,7 +242,8 @@ function renderRoleCard() {
         <h2>You are: ${escapeHtml(roleText)}</h2>
         <span class="badge ${me.alive ? "alive-badge" : "dead-badge"}">${me.alive ? "Alive" : "Dead"}</span>
       </div>
-      ${me.role ? `<p>${escapeHtml(state.roleDescriptions[me.role] || "")}</p>` : `<p class="muted">Your role will appear here after the host starts the game.</p>`}
+      <p>${escapeHtml(state.roleDescriptions[me.role] || "")}</p>
+      ${state.phase !== "night" ? `<button id="hide-private-btn" class="secondary">Hide role</button>` : ""}
       ${renderMayorRevealButton()}
       ${renderPrivateMessages()}
     </section>
@@ -218,12 +290,12 @@ function renderHostControls() {
       <h2>Host controls</h2>
       <div class="button-grid">
         <button id="start-game-btn" class="primary" ${state.phase !== "lobby" ? "disabled" : ""}>Start Game</button>
-        <button id="force-sleep-btn" ${!state.hasStarted || state.phase === "gameover" ? "disabled" : ""}>Force Everyone To Sleep</button>
-        <button id="resolve-night-btn" ${state.phase !== "night" ? "disabled" : ""}>Resolve Night</button>
+        <button id="force-sleep-btn" ${state.phase !== "day" ? "disabled" : ""}>Start Night Early</button>
         <button id="resolve-votes-btn" ${state.phase !== "day" ? "disabled" : ""}>Resolve Votes</button>
         <button id="end-game-btn" ${!state.hasStarted || state.phase === "gameover" ? "disabled" : ""}>End Game</button>
         <button id="reset-game-btn" class="danger">Reset Game</button>
       </div>
+      <a class="subtle-link" href="/table" target="_blank" rel="noopener">Open table announcer</a>
       ${state.phase === "lobby" ? renderRoleConfig() : `<p class="muted">Role configuration is locked after the game starts.</p>`}
     </section>
   `;
@@ -283,7 +355,6 @@ function renderActionCard() {
     `;
   }
 
-  if (state.phase === "night") return renderNightActions();
   if (state.phase === "day") return renderDayVoting();
 
   return "";
@@ -292,25 +363,20 @@ function renderActionCard() {
 function renderNightActions() {
   const role = state.me.role;
 
-  if (state.me.nightActionSubmitted) {
-    return `
-      <section class="card">
-        <h2>Night action submitted</h2>
-        <p>Wait for the other night actions or for the host to resolve the night.</p>
-      </section>
-    `;
-  }
-
   if (role === "Vampire") return renderVampireAction();
   if (role === "Doctor") return renderDoctorAction();
   if (role === "Detective") return renderDetectiveAction();
-  if (role === "Hunter") return renderHunterAction();
+  if (role === "Hunter" && !state.me.hunterUsed) return renderHunterAction();
   if (role === "Transporter") return renderTransporterAction();
 
   return `
-    <section class="card">
-      <h2>Night</h2>
-      <p>Your role has no night action. Stay quiet until day begins.</p>
+    <section class="card action-card">
+      <h2>Keep watch</h2>
+      <p>Pick someone to remember during the day. Only you can see your choice.</p>
+      <div class="target-grid">
+        ${targetButtons(otherAlivePlayers(), "night", "watch")}
+        <button class="secondary" data-night-skip="watch">Keep watch without a target</button>
+      </div>
     </section>
   `;
 }
@@ -357,15 +423,6 @@ function renderDetectiveAction() {
 }
 
 function renderHunterAction() {
-  if (state.me.hunterUsed) {
-    return `
-      <section class="card action-card">
-        <h2>Hunter action</h2>
-        <p>You already used your one shot.</p>
-      </section>
-    `;
-  }
-
   return `
     <section class="card action-card">
       <h2>Hunter action</h2>
@@ -445,6 +502,7 @@ function targetButtons(players, mode, actionName, disabledPlayerId = null) {
 }
 
 function renderMayorRevealButton() {
+  if (state.phase !== "day") return "";
   if (state.me.role !== "Mayor" || !state.me.alive || state.me.mayorRevealed || !state.hasStarted || state.phase === "gameover") {
     return "";
   }
@@ -503,6 +561,18 @@ function renderRoleDescriptions() {
 // ##################################### 10
 // Dynamic event binding after render
 function bindDynamicButtons() {
+  $("show-private-btn")?.addEventListener("click", () => {
+    privateView = true;
+    render();
+  });
+  $("hide-private-btn")?.addEventListener("click", hidePrivateView);
+  $("confirm-night-btn")?.addEventListener("click", submitNightChoice);
+  $("change-night-btn")?.addEventListener("click", () => {
+    pendingNightChoice = null;
+    render();
+  });
+  $("skip-night-btn")?.addEventListener("click", () => socket.emit("skipNightTurn", state.nightTurn?.key));
+
   const startButton = $("start-game-btn");
   if (startButton) startButton.addEventListener("click", () => socket.emit("startGame"));
 
@@ -548,19 +618,14 @@ function bindDynamicButtons() {
 
   document.querySelectorAll("[data-night-action]").forEach((button) => {
     button.addEventListener("click", () => {
-      socket.emit("nightAction", {
-        action: button.dataset.nightAction,
-        targetId: button.dataset.targetId,
-      });
+      const targetId = button.dataset.targetId;
+      chooseNightAction({ targetId }, playerName(targetId));
     });
   });
 
   document.querySelectorAll("[data-night-skip]").forEach((button) => {
     button.addEventListener("click", () => {
-      socket.emit("nightAction", {
-        action: button.dataset.nightSkip,
-        skip: true,
-      });
+      chooseNightAction({ skip: true }, button.textContent.trim());
     });
   });
 
@@ -580,11 +645,7 @@ function bindDynamicButtons() {
   if (sendTransportButton) {
     sendTransportButton.addEventListener("click", () => {
       if (selectedTransporterTargets.length !== 2) return;
-      socket.emit("nightAction", {
-        action: "transporter",
-        targetIds: selectedTransporterTargets,
-      });
-      selectedTransporterTargets = [];
+      chooseNightAction({ targetIds: [...selectedTransporterTargets] }, selectedTransporterTargets.map(playerName).join(" and "));
     });
   }
 
@@ -595,6 +656,27 @@ function bindDynamicButtons() {
       render();
     });
   }
+}
+
+function chooseNightAction(action, label) {
+  pendingNightChoice = { action, label };
+  render();
+}
+
+function submitNightChoice() {
+  const turnKey = state?.nightTurn?.key;
+  if (!turnKey || !pendingNightChoice || savingTurn) return;
+  if (!socket.connected) return showToast("Reconnecting. Please try again in a moment.");
+
+  const { action } = pendingNightChoice;
+  savingTurn = true;
+  hidePrivateView();
+  socket.timeout(6500).emit("nightAction", { ...action, turnKey }, (error, message) => {
+    if (state.nightTurn?.key !== turnKey || (!error && !message)) return;
+    savingTurn = false;
+    render();
+    showToast(message || "Could not confirm your choice. Check whose turn it is and try again.");
+  });
 }
 
 // ##################################### 11
@@ -612,8 +694,22 @@ function toggleTransporterTarget(targetId) {
 // ##################################### 12
 // Socket listeners
 socket.on("state", (newState) => {
+  if (newState.phase !== state?.phase || newState.nightTurn?.key !== state?.nightTurn?.key) {
+    privateView = false;
+    pendingNightChoice = null;
+    selectedTransporterTargets = [];
+    savingTurn = false;
+  }
   state = newState;
+  $("host-code-input").value = "";
   render();
+});
+
+socket.on("disconnect", () => {
+  if (!state?.me) return;
+  savingTurn = false;
+  hidePrivateView();
+  showToast("Connection lost. Reconnecting…");
 });
 
 socket.on("errorMessage", (message) => {

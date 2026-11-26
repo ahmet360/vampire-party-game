@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Vampire Table Announcer</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <main class="table-screen screen">
+    <section class="card table-card">
+      <div class="card-title-row">
+        <h1>Table announcer</h1>
+        <span class="badge" id="table-connection" role="status">Connecting…</span>
+      </div>
+      <p class="muted" id="table-phase">Lobby</p>
+      <h2 id="table-turn" aria-live="polite">Waiting for the game</h2>
+      <p id="table-progress"></p>
+      <div class="button-grid">
+        <button id="table-audio" class="primary" type="button" disabled>Enable announcements</button>
+        <button id="table-replay" class="secondary" type="button" disabled>Repeat last cue</button>
+      </div>
+      <p id="table-audio-status" class="muted" role="status">Turn up this device’s volume, then enable announcements.</p>
+      <a class="subtle-link" href="/">Back to player sign-in</a>
+    </section>
+    <section class="card">
+      <h2>Recent cues</h2>
+      <ol id="table-cues" class="table-cues" reversed></ol>
+    </section>
+  </main>
+  <script src="/socket.io/socket.io.js"></script>
+  <script src="/table.js"></script>
+</body>
+</html>

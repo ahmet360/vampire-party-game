@@ -6,6 +6,7 @@ const http = require("http");
 const os = require("os");
 const path = require("path");
 const { Server } = require("socket.io");
+const { renderAnnouncement } = require("./announce-audio");
 
 const app = express();
 const server = http.createServer(app);
@@ -38,6 +39,8 @@ app.use((request, response, next) => {
   next();
 });
 app.get("/healthz", (request, response) => response.type("text").send("ok"));
+app.get("/table", (request, response) => response.sendFile(path.join(__dirname, "public", "table.html")));
+app.get("/table-audio/:session/:id", sendAnnouncementAudio);
 app.use(express.static(path.join(__dirname, "public")));
 
 // ##################################### 2
@@ -58,10 +61,18 @@ const ROLE_DESCRIPTIONS = {
   Doctor: "Save one player each night. You cannot save the same player two nights in a row.",
   Jester: "You win immediately if the town votes you out. Detective treats Jester as evil.",
   Detective: "Investigate one player each night. Good players show as not evil. Evil players need two checks for exact role.",
-  Villager: "No special ability. Vote during the day and find the vampires.",
+  Villager: "Keep watch during the night, then vote during the day and find the vampires.",
   Hunter: "Once per game, shoot one player at night. If they are a vampire, only they die. Otherwise, both of you die.",
   Mayor: "Reveal once. After revealing, your name turns blue and your vote counts as 2.",
   Transporter: "Choose two players each night. Any night action aimed at one is redirected to the other.",
+};
+
+const NIGHT_ACTIONS = {
+  Vampire: "vampires",
+  Doctor: "doctors",
+  Detective: "detectives",
+  Hunter: "hunters",
+  Transporter: "transporters",
 };
 
 function makeDefaultRoleConfig() {
@@ -81,6 +92,11 @@ function makeDefaultRoleConfig() {
 // Game state
 const players = new Map();
 const socketToPlayerId = new Map();
+const tableRoom = "table-announcer";
+const tableSession = randomUUID();
+const spokenAudio = new WeakMap();
+const audioTestCue = { id: 0, text: "Announcements are on." };
+let cueSequence = 0;
 
 const game = {
   phase: "lobby",
@@ -90,10 +106,14 @@ const game = {
   roleConfig: makeDefaultRoleConfig(),
   vampireCanSkip: false,
   nightActions: makeEmptyNightActions(),
+  nightTurns: [],
+  nightTurnIndex: 0,
+  nightCycle: null,
   dayVotes: {},
   doctorLastSave: {},
   detectiveMemory: {},
   messages: [],
+  tableCues: [],
   gameOver: null,
 };
 
@@ -170,6 +190,54 @@ function pushMessage(message) {
   }
 }
 
+function announceToTable(text) {
+  game.tableCues.push({ id: ++cueSequence, text });
+  if (game.tableCues.length > 12) game.tableCues.shift();
+}
+
+async function sendAnnouncementAudio(request, response) {
+  if (request.params.session !== tableSession || !/^\d+$/.test(request.params.id)) return response.sendStatus(404);
+  const id = Number(request.params.id);
+  const cue = id === 0 ? audioTestCue : game.tableCues.find((entry) => entry.id === id);
+  if (!cue) return response.sendStatus(404);
+
+  try {
+    if (!spokenAudio.has(cue)) spokenAudio.set(cue, renderAnnouncement(cue.text));
+    const audio = await spokenAudio.get(cue);
+    response.set("Cache-Control", "no-store").type("audio/wav").send(audio);
+  } catch {
+    response.sendStatus(503);
+  }
+}
+
+function getNightTurn() {
+  const playerId = game.nightTurns[game.nightTurnIndex];
+  if (game.phase !== "night" || !playerId) return null;
+  return {
+    key: `${game.nightCycle}:${game.nightTurnIndex}`,
+    playerId,
+    number: game.nightTurnIndex + 1,
+    total: game.nightTurns.length,
+  };
+}
+
+function buildTableState() {
+  const turn = getNightTurn();
+  const player = turn ? getPlayer(turn.playerId) : null;
+  return {
+    session: tableSession,
+    phase: game.phase,
+    dayNumber: game.dayNumber,
+    nightNumber: game.nightNumber,
+    playerCount: getAllPlayers().length,
+    aliveCount: getAlivePlayers().length,
+    votesCast: Object.keys(game.dayVotes).length,
+    nightTurn: player ? { name: player.name, connected: player.connected, number: turn.number, total: turn.total } : null,
+    winner: game.gameOver?.winner || null,
+    cues: game.tableCues,
+  };
+}
+
 function pushPrivateMessage(playerId, message) {
   const player = getPlayer(playerId);
   if (!player) return;
@@ -194,6 +262,7 @@ function sendError(socket, message) {
 // Public state builder and sync
 function buildStateFor(playerId) {
   const me = getPlayer(playerId);
+  const turnIndex = game.nightTurns.indexOf(playerId);
 
   return {
     phase: game.phase,
@@ -204,6 +273,8 @@ function buildStateFor(playerId) {
     roleDescriptions: ROLE_DESCRIPTIONS,
     roleConfig: cloneRoleConfig(),
     vampireCanSkip: game.vampireCanSkip,
+    nightTurn: getNightTurn(),
+    votesCast: Object.keys(game.dayVotes).length,
     messages: game.messages.slice(-30),
     gameOver: game.gameOver,
     selectedRoleCount: countSelectedRoles(),
@@ -229,7 +300,7 @@ function buildStateFor(playerId) {
           mayorRevealed: me.mayorRevealed,
           hunterUsed: me.hunterUsed,
           privateMessages: me.privateMessages.slice(-10),
-          nightActionSubmitted: hasNightActionSubmitted(me.id),
+          nightTurnComplete: turnIndex >= 0 && turnIndex < game.nightTurnIndex,
           dayVoteTarget: game.dayVotes[me.id] || null,
           doctorLastSave: game.doctorLastSave[me.id] || null,
         }
@@ -242,6 +313,7 @@ function emitAll() {
     if (!player.connected || !player.socketId) continue;
     io.to(player.socketId).emit("state", buildStateFor(player.id));
   }
+  io.to(tableRoom).emit("tableState", buildTableState());
 }
 
 // ##################################### 6
@@ -303,14 +375,12 @@ function startGame(socket) {
   const shuffledPlayers = shuffle(activePlayers);
 
   game.hasStarted = true;
-  game.phase = "night";
   game.dayNumber = 0;
-  game.nightNumber = 1;
-  game.nightActions = makeEmptyNightActions();
-  game.dayVotes = {};
+  game.nightNumber = 0;
   game.doctorLastSave = {};
   game.detectiveMemory = {};
   game.messages = [];
+  game.tableCues = [];
   game.gameOver = null;
 
   for (const player of players.values()) {
@@ -329,7 +399,7 @@ function startGame(socket) {
     player.privateMessages = [];
   });
 
-  pushMessage("Roles assigned. Night 1 begins. Everyone sleep.");
+  startNight();
 }
 
 function resetGame() {
@@ -351,13 +421,18 @@ function resetGame() {
   game.dayNumber = 0;
   game.nightNumber = 0;
   game.nightActions = makeEmptyNightActions();
+  game.nightTurns = [];
+  game.nightTurnIndex = 0;
+  game.nightCycle = null;
   game.dayVotes = {};
   game.doctorLastSave = {};
   game.detectiveMemory = {};
   game.messages = [];
+  game.tableCues = [];
   game.gameOver = null;
 
   pushMessage("Game reset. Configure roles and start again.");
+  announceToTable("Back to the lobby. Waiting for the host to start.");
 }
 
 function setGameOver(winner, reason) {
@@ -374,6 +449,7 @@ function setGameOver(winner, reason) {
   };
 
   pushMessage(`Game over: ${winner}. ${reason}`);
+  announceToTable(winner === "No winner" ? "The host ended the game." : `Game over. Winner: ${winner}.`);
 }
 
 // ##################################### 7
@@ -400,36 +476,30 @@ function checkWinConditions() {
 
 // ##################################### 8
 // Night action helpers
-function hasNightActionSubmitted(playerId) {
-  const player = getPlayer(playerId);
-  if (!player || game.phase !== "night" || !player.alive) return false;
+function startNight() {
+  game.phase = "night";
+  game.nightNumber += 1;
+  game.nightActions = makeEmptyNightActions();
+  game.dayVotes = {};
+  game.nightTurns = shuffle(getAlivePlayers()).map((player) => player.id);
+  game.nightTurnIndex = 0;
+  game.nightCycle = randomUUID();
 
-  if (player.role === "Vampire") return Boolean(game.nightActions.vampires[playerId]);
-  if (player.role === "Doctor") return Boolean(game.nightActions.doctors[playerId]);
-  if (player.role === "Detective") return Boolean(game.nightActions.detectives[playerId]);
-  if (player.role === "Hunter" && !player.hunterUsed) return Boolean(game.nightActions.hunters[playerId]);
-  if (player.role === "Transporter") return Boolean(game.nightActions.transporters[playerId]);
-
-  return false;
+  const message = `Night ${game.nightNumber} begins. Wait for your name before opening your turn.`;
+  pushMessage(message);
+  announceToTable(message);
+  announceNightTurn();
 }
 
-function getNightActorIds() {
-  return getAlivePlayers()
-    .filter((player) => {
-      if (player.role === "Vampire") return true;
-      if (player.role === "Doctor") return true;
-      if (player.role === "Detective") return true;
-      if (player.role === "Transporter") return true;
-      if (player.role === "Hunter") return !player.hunterUsed;
-      return false;
-    })
-    .map((player) => player.id);
+function announceNightTurn() {
+  const turn = getNightTurn();
+  if (turn) announceToTable(`${getPlayerName(turn.playerId)}, it's your turn.`);
 }
 
-function allNightActionsSubmitted() {
-  const actorIds = getNightActorIds();
-  if (actorIds.length === 0) return false;
-  return actorIds.every((playerId) => hasNightActionSubmitted(playerId));
+function advanceNightTurn() {
+  game.nightTurnIndex += 1;
+  if (getNightTurn()) announceNightTurn();
+  else resolveNight();
 }
 
 function buildTransporterPairs(actions) {
@@ -479,11 +549,15 @@ function getTopTargetFromTally(tally) {
 function resolveNight() {
   if (game.phase !== "night") return;
 
+  const roleCues = Object.keys(NIGHT_ACTIONS)
+    .filter((role) => game.roleConfig[role].enabled && game.roleConfig[role].count > 0)
+    .map((role) => `${role} turn closed.`);
+  if (roleCues.length) announceToTable(roleCues.join(" "));
+
   const actions = game.nightActions;
   const transporterPairs = buildTransporterPairs(actions);
   const savedTargets = new Set();
   const deathSet = new Set();
-  const nightNotes = [];
 
   Object.entries(actions.doctors).forEach(([doctorId, action]) => {
     const doctor = getPlayer(doctorId);
@@ -544,15 +618,8 @@ function resolveNight() {
     if (!target?.alive) return;
 
     hunter.hunterUsed = true;
-
-    if (target.role === "Vampire") {
-      deathSet.add(actualTargetId);
-      nightNotes.push(`The Hunter shot ${target.name}. ${target.name} died.`);
-    } else {
-      deathSet.add(actualTargetId);
-      deathSet.add(hunterId);
-      nightNotes.push(`The Hunter shot ${target.name}. ${target.name} and ${hunter.name} died.`);
-    }
+    deathSet.add(actualTargetId);
+    if (target.role !== "Vampire") deathSet.add(hunterId);
   });
 
   const vampireTally = {};
@@ -570,38 +637,17 @@ function resolveNight() {
   });
 
   const vampirePick = getTopTargetFromTally(vampireTally);
-  let vampireStoppedByDoctor = false;
-  let vampireKilledName = null;
-
-  if (vampirePick.targetId) {
-    if (savedTargets.has(vampirePick.targetId)) {
-      vampireStoppedByDoctor = true;
-    } else {
-      deathSet.add(vampirePick.targetId);
-      vampireKilledName = getPlayerName(vampirePick.targetId);
-    }
-  }
+  if (vampirePick.targetId && !savedTargets.has(vampirePick.targetId)) deathSet.add(vampirePick.targetId);
 
   for (const playerId of deathSet) {
     const player = getPlayer(playerId);
     if (player?.alive) player.alive = false;
   }
 
-  if (vampireStoppedByDoctor && deathSet.size === 0) {
-    pushMessage("No one was killed.");
-  } else if (vampireStoppedByDoctor) {
-    pushMessage("The Doctor stopped the vampire attack.");
-  } else if (vampireKilledName) {
-    pushMessage(`${vampireKilledName} was killed during the night.`);
-  } else if (vampirePick.tied) {
-    pushMessage("The vampires could not agree on a target. No one was killed by vampires.");
-  }
-
-  nightNotes.forEach((note) => pushMessage(note));
-
-  if (!vampireKilledName && !vampireStoppedByDoctor && !vampirePick.tied && deathSet.size === 0) {
-    pushMessage("The night was quiet. No one was killed.");
-  }
+  const names = [...deathSet].map(getPlayerName);
+  const outcome = names.length ? `Lost overnight: ${names.join(", ")}.` : "Everyone survived the night.";
+  pushMessage(outcome);
+  announceToTable(outcome);
 
   game.nightActions = makeEmptyNightActions();
 
@@ -611,6 +657,7 @@ function resolveNight() {
   game.dayNumber += 1;
   game.dayVotes = {};
   pushMessage(`Day ${game.dayNumber} begins. Discuss and vote.`);
+  announceToTable(`Day ${game.dayNumber}. Discuss and vote on your phones.`);
 }
 
 // ##################################### 10
@@ -639,11 +686,13 @@ function resolveVotes() {
 
   if (!voteResult.targetId || voteResult.tied) {
     pushMessage("The vote tied. No one was eliminated.");
+    announceToTable("The vote tied. No one was eliminated.");
   } else {
     const eliminated = getPlayer(voteResult.targetId);
     if (eliminated?.alive) {
       eliminated.alive = false;
       pushMessage(`${eliminated.name} was voted out.`);
+      announceToTable(`${eliminated.name} was voted out.`);
 
       if (eliminated.role === "Jester") {
         setGameOver("Jester", `${eliminated.name} was voted out and wins immediately.`);
@@ -654,16 +703,17 @@ function resolveVotes() {
 
   if (checkWinConditions()) return;
 
-  game.phase = "night";
-  game.nightNumber += 1;
-  game.nightActions = makeEmptyNightActions();
-  game.dayVotes = {};
-  pushMessage(`Night ${game.nightNumber} begins. Everyone sleep.`);
+  startNight();
 }
 
 // ##################################### 11
 // Socket.IO events
 io.on("connection", (socket) => {
+  socket.on("watchTable", () => {
+    socket.join(tableRoom);
+    socket.emit("tableState", buildTableState());
+  });
+
   socket.on("join", (payload) => {
     if (!payload || typeof payload !== "object" || socketToPlayerId.has(socket.id)) return;
     const { sessionId, name, hostCode } = payload;
@@ -755,16 +805,8 @@ io.on("connection", (socket) => {
 
   socket.on("forceSleep", () => {
     if (!isHostSocket(socket)) return;
-    if (!game.hasStarted || game.phase === "gameover") return;
-
-    if (game.phase !== "night") {
-      game.nightNumber += 1;
-    }
-
-    game.phase = "night";
-    game.dayVotes = {};
-    game.nightActions = makeEmptyNightActions();
-    pushMessage(`The host forced everyone to sleep. Night ${game.nightNumber} begins.`);
+    if (game.phase !== "day") return;
+    startNight();
     emitAll();
   });
 
@@ -774,72 +816,55 @@ io.on("connection", (socket) => {
     emitAll();
   });
 
-  socket.on("nightAction", (payload) => {
+  socket.on("skipNightTurn", (turnKey) => {
+    const turn = getNightTurn();
+    if (!isHostSocket(socket) || !turn || turn.key !== turnKey) return;
+    advanceNightTurn();
+    emitAll();
+  });
+
+  socket.on("nightAction", (payload, acknowledge) => {
     const playerId = socketToPlayerId.get(socket.id);
     const player = getPlayer(playerId);
-    if (!player?.alive || game.phase !== "night") return;
-
-    const action = payload || {};
-
-    if (player.role === "Vampire") {
-      if (action.skip && !game.vampireCanSkip) return;
-      if (!action.skip && !isAlive(action.targetId)) return;
-      game.nightActions.vampires[playerId] = {
-        skip: Boolean(action.skip),
-        targetId: action.skip ? null : action.targetId,
-      };
+    const turn = getNightTurn();
+    const report = typeof acknowledge === "function" ? acknowledge : () => {};
+    if (!player?.alive || !turn || turn.playerId !== playerId || turn.key !== payload?.turnKey) {
+      return report("This turn is no longer available. Check the current turn on your screen.");
     }
 
-    if (player.role === "Doctor") {
-      if (!action.skip && !isAlive(action.targetId)) return;
-      if (!action.skip && game.doctorLastSave[playerId] === action.targetId) {
-        sendError(socket, "Doctor cannot save the same player two nights in a row.");
-        return;
+    const { role } = player;
+    const { targetId, targetIds } = payload;
+    const skip = payload.skip === true;
+    const group = player.hunterUsed && role === "Hunter" ? null : NIGHT_ACTIONS[role];
+    if (role === "Vampire" && skip && !game.vampireCanSkip) return report("The host has disabled skipping for Vampires.");
+
+    if (role === "Transporter") {
+      const pair = Array.isArray(targetIds) ? targetIds : [];
+      if (!skip && (pair.length !== 2 || pair[0] === pair[1] || !pair.every(isAlive))) {
+        return report("Choose two different living players.");
       }
-      game.nightActions.doctors[playerId] = {
-        skip: Boolean(action.skip),
-        targetId: action.skip ? null : action.targetId,
-      };
+      game.nightActions[group][playerId] = { skip, targetIds: skip ? [] : pair };
+    } else {
+      if (!skip && (!isAlive(targetId) || (targetId === playerId && role !== "Doctor"))) {
+        return report("Choose an available player.");
+      }
+      if (role === "Doctor" && !skip && game.doctorLastSave[playerId] === targetId) {
+        return report("You cannot save the same player two nights in a row.");
+      }
+      if (group) game.nightActions[group][playerId] = { skip, targetId: skip ? null : targetId };
+      else if (!skip) pushPrivateMessage(playerId, `You kept watch on ${getPlayerName(targetId)}.`);
     }
 
-    if (player.role === "Detective") {
-      if (!action.skip && !isAlive(action.targetId)) return;
-      game.nightActions.detectives[playerId] = {
-        skip: Boolean(action.skip),
-        targetId: action.skip ? null : action.targetId,
-      };
-    }
-
-    if (player.role === "Hunter" && !player.hunterUsed) {
-      if (!action.skip && !isAlive(action.targetId)) return;
-      game.nightActions.hunters[playerId] = {
-        skip: Boolean(action.skip),
-        targetId: action.skip ? null : action.targetId,
-      };
-    }
-
-    if (player.role === "Transporter") {
-      const ids = Array.isArray(action.targetIds) ? action.targetIds.slice(0, 2) : [];
-      const validPair = ids.length === 2 && ids[0] !== ids[1] && ids.every((id) => isAlive(id));
-      if (!action.skip && !validPair) return;
-      game.nightActions.transporters[playerId] = {
-        skip: Boolean(action.skip),
-        targetIds: action.skip ? [] : ids,
-      };
-    }
-
-    if (allNightActionsSubmitted()) {
-      resolveNight();
-    }
-
+    advanceNightTurn();
     emitAll();
+    report(null);
   });
 
   socket.on("revealMayor", () => {
     const playerId = socketToPlayerId.get(socket.id);
     const player = getPlayer(playerId);
     if (!player?.alive || player.role !== "Mayor" || player.mayorRevealed) return;
-    if (!game.hasStarted || game.phase === "gameover") return;
+    if (game.phase !== "day") return;
 
     player.mayorRevealed = true;
     pushMessage(`${player.name} has revealed as the Mayor! Their vote now counts as 2.`);
@@ -854,7 +879,6 @@ io.on("connection", (socket) => {
     if (!isAlive(targetId)) return;
 
     game.dayVotes[voterId] = targetId;
-    pushMessage(`${voter.name} voted.`);
 
     if (allDayVotesSubmitted()) {
       resolveVotes();

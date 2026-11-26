@@ -35,6 +35,7 @@
 
         <button class="primary" type="submit">Join Game</button>
       </form>
+      <a class="subtle-link" href="/table">Open table announcer</a>
     </section>
   </div>
 
@@ -44,7 +45,6 @@
     <header class="top-bar">
       <div class="top-bar-title">
         <strong>Vampire Game</strong>
-        <span class="badge">Local Wi-Fi</span>
       </div>
 
       <div id="top-player-list" class="player-list"></div>
@@ -55,7 +55,8 @@
     <section id="role-descriptions"></section>
   </div>
 
-  <div id="toast" class="toast hidden"></div>
+  <main id="night-panel" class="night-panel hidden"></main>
+  <div id="toast" class="toast hidden" role="status"></div>
 
   <!-- ##################################### 5 -->
   <!-- Scripts -->
