@@ -1,0 +1,65 @@
+<!-- ##################################### 1 -->
+<!-- Document shell and metadata -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Vampire Social Deduction</title>
+
+  <!-- ##################################### 2 -->
+  <!-- Mobile dark UI styles -->
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+
+<body>
+  <!-- ##################################### 3 -->
+  <!-- Join screen -->
+  <div id="join-screen" class="screen join-wrap">
+    <section class="join-card">
+      <h1>Vampire</h1>
+      <p class="hint">
+        Enter your name to join. If you’re hosting, enter your host code too.
+      </p>
+
+      <form id="join-form">
+        <label>
+          Player name
+          <input id="name-input" type="text" placeholder="Enter your name" maxlength="24" required />
+        </label>
+
+        <label>
+          Host code
+          <input id="host-code-input" type="password" placeholder="Optional" autocomplete="off" />
+        </label>
+
+        <button class="primary" type="submit">Join Game</button>
+      </form>
+    </section>
+  </div>
+
+  <!-- ##################################### 4 -->
+  <!-- Game screen -->
+  <div id="game-screen" class="screen hidden">
+    <header class="top-bar">
+      <div class="top-bar-title">
+        <strong>Vampire Game</strong>
+        <span class="badge">Local Wi-Fi</span>
+      </div>
+
+      <div id="top-player-list" class="player-list"></div>
+    </header>
+
+    <main id="app"></main>
+
+    <section id="role-descriptions"></section>
+  </div>
+
+  <div id="toast" class="toast hidden"></div>
+
+  <!-- ##################################### 5 -->
+  <!-- Scripts -->
+  <script src="/socket.io/socket.io.js"></script>
+  <script src="/client.js"></script>
+</body>
+</html>
