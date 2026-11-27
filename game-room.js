@@ -9,26 +9,35 @@ const ROLE_ORDER = [
   "Hunter",
   "Mayor",
   "Transporter",
+  "Thief",
+  "Silencer",
+  "Seer",
 ];
 
 const ROLE_DESCRIPTIONS = {
-  Vampire: "Kill one player each night. Vampires win when alive vampires are equal to or greater than alive non-vampires.",
+  Vampire: "Vote for a victim each night. A tied kill vote fizzles. You can see the living evil team in your private role card.",
   Doctor: "Save one player each night. You cannot save the same player two nights in a row.",
-  Jester: "You win immediately if the town votes you out. Detective treats Jester as evil.",
-  Detective: "Investigate one player each night. Good players show as not evil. Evil players need two checks for exact role.",
-  Villager: "Once per game, watch someone to learn at dawn whether they used a targeted ability that night.",
-  Hunter: "Once per game, shoot one player at night. If they are a vampire, only they die. Otherwise, both of you die.",
-  Mayor: "Reveal once. After revealing, your name turns blue and your vote counts as 2.",
-  Transporter: "Choose two players each night. Any night action aimed at one is redirected to the other.",
+  Jester: "You win individually if the town votes you out. You know the other Jesters. The match continues for everyone else.",
+  Detective: "Investigate one player each night. The first check of an evil player is suspicious. A repeat check shows their exact role.",
+  Villager: "Pick a name as cover at night. Your choice has no effect. Discuss and vote during the day.",
+  Hunter: "You have one shot for the match, by day or by night. If the target is a Vampire, only they die. Otherwise you die too.",
+  Mayor: "Reveal during the day or night from your private role card. Once revealed, your vote counts as 2. Your night choice is cover.",
+  Transporter: "Pick two players at night. Saves, investigations, shots, and kill votes aimed at either player go to the other.",
+  Thief: "Once per match, choose someone at night to steal their role without seeing it first. Their night ability fizzles. If you both survive, you swap into their role next night and they become a Villager. Until then, you win with the Villagers.",
+  Silencer: "Once per match, choose a player to block their night ability. You win with the Vampires. They can see that you are on their team.",
+  Seer: "Your private role card highlights players with a role. Keep those names to yourself. You have one guess: name a player and their exact role. If you’re right, the game reveals you and their role. If you’re wrong, you die.",
 };
 
-const NIGHT_ACTIONS = {
-  Vampire: "vampires",
-  Doctor: "doctors",
-  Detective: "detectives",
-  Hunter: "hunters",
-  Transporter: "transporters",
-};
+const EVIL_ROLES = new Set(["Vampire", "Silencer"]);
+const NIGHT_ROLES = new Set(["Vampire", "Doctor", "Detective", "Hunter", "Transporter", "Thief", "Silencer"]);
+const ONE_USE_ROLES = new Set(["Hunter", "Thief", "Silencer", "Seer"]);
+const OATH_MODES = ["off", "random-town", "random-any", "town", "non-evil", "evil", "everyone"];
+
+function alignment(role) {
+  if (EVIL_ROLES.has(role)) return "Evil";
+  if (role === "Jester" || role === "Thief") return "Neutral";
+  return "Town";
+}
 
 const audioTestCue = { id: 0, text: "Announcements are on." };
 const MAX_PLAYERS = 24;
@@ -66,10 +75,11 @@ function createRoom(io, code, hostSession, timing, practice = false) {
     nightNumber: 0,
     roleConfig: makeDefaultRoleConfig(),
     vampireCanSkip: false,
-    nightActions: makeEmptyNightActions(),
-    nightTurns: [],
-    nightTurnIndex: 0,
-    nightCycle: null,
+    oathMode: "off",
+    deadlockDraw: true,
+    nightChoices: new Map(),
+    nightKey: null,
+    pendingThefts: [],
     clock: null,
     dayVotes: {},
     doctorLastSave: {},
@@ -78,17 +88,6 @@ function createRoom(io, code, hostSession, timing, practice = false) {
     tableCues: [],
     gameOver: null,
   };
-
-  function makeEmptyNightActions() {
-    return {
-      vampires: {},
-      doctors: {},
-      detectives: {},
-      hunters: {},
-      transporters: {},
-      watches: {},
-    };
-  }
 
   // General helpers
   function cleanName(name) {
@@ -152,25 +151,12 @@ function createRoom(io, code, hostSession, timing, practice = false) {
     }
   }
 
-  function announceToTable(text, turnKey = null) {
-    game.tableCues.push({ id: ++cueSequence, text, turnKey });
+  function announceToTable(text) {
+    game.tableCues.push({ id: ++cueSequence, text });
     if (game.tableCues.length > 12) game.tableCues.shift();
   }
 
-  function getNightTurn() {
-    const playerId = game.nightTurns[game.nightTurnIndex];
-    if (game.phase !== "night" || !playerId) return null;
-    return {
-      key: `${game.nightCycle}:${game.nightTurnIndex}`,
-      playerId,
-      number: game.nightTurnIndex + 1,
-      total: game.nightTurns.length,
-    };
-  }
-
   function buildTableState() {
-    const turn = getNightTurn();
-    const player = turn ? getPlayer(turn.playerId) : null;
     return {
       roomCode: code,
       session: tableSession,
@@ -182,7 +168,6 @@ function createRoom(io, code, hostSession, timing, practice = false) {
       playerCount: getAllPlayers().length,
       aliveCount: getAlivePlayers().length,
       votesCast: Object.keys(game.dayVotes).length,
-      nightTurn: player ? { key: turn.key, name: player.name, connected: player.connected, number: turn.number, total: turn.total } : null,
       winner: game.gameOver?.winner || null,
       cues: game.tableCues,
     };
@@ -212,10 +197,20 @@ function createRoom(io, code, hostSession, timing, practice = false) {
     socket.emit("errorMessage", message);
   }
 
+  function knownPlayers(me) {
+    if (me.role !== "Vampire" && me.role !== "Jester") return [];
+    return getAllPlayers().filter((player) => player !== me
+      && (me.role === "Vampire" ? EVIL_ROLES.has(player.role) : player.role === "Jester"))
+      .map(({ name, role }) => ({ name, role }));
+  }
+
+  function seerTargets(me) {
+    return getAlivePlayers().filter((player) => player !== me && player.role !== "Villager");
+  }
+
   // Public state builder and sync
   function buildStateFor(playerId) {
     const me = getPlayer(playerId);
-    const turnIndex = game.nightTurns.indexOf(playerId);
 
     return {
       roomCode: code,
@@ -230,8 +225,11 @@ function createRoom(io, code, hostSession, timing, practice = false) {
       roleOrder: ROLE_ORDER,
       roleDescriptions: ROLE_DESCRIPTIONS,
       roleConfig: cloneRoleConfig(),
+      roleAlignments: Object.fromEntries(ROLE_ORDER.map((role) => [role, alignment(role)])),
       vampireCanSkip: game.vampireCanSkip,
-      nightTurn: getNightTurn(),
+      oathMode: game.oathMode,
+      deadlockDraw: game.deadlockDraw,
+      nightKey: game.phase === "night" ? game.nightKey : null,
       votesCast: Object.keys(game.dayVotes).length,
       messages: game.messages.slice(-30),
       gameOver: game.gameOver,
@@ -246,6 +244,8 @@ function createRoom(io, code, hostSession, timing, practice = false) {
         isHost: player.isHost,
         isBot: Boolean(player.isBot),
         mayorRevealed: player.mayorRevealed,
+        jesterWon: Boolean(player.jesterWon),
+        publicRole: player.publicRole || null,
         role: game.phase === "gameover" ? player.role : null,
       })),
       ...(practice && me?.isHost ? {
@@ -269,10 +269,21 @@ function createRoom(io, code, hostSession, timing, practice = false) {
             botAuto: Boolean(me.botAuto),
             role: me.role,
             mayorRevealed: me.mayorRevealed,
-            hunterUsed: me.hunterUsed,
-            villagerWatchUsed: me.villagerWatchUsed,
+            abilityUsed: Boolean(me.abilityUsed),
+            seerTargets: me.role === "Seer" ? seerTargets(me).map(({ id }) => id) : [],
+            seerGuessPending: Boolean(game.nightChoices.get(me.id)?.guess),
+            oathActedTonight: Boolean(game.nightChoices.get(me.id)?.oath),
+            knownPlayers: knownPlayers(me),
+            oath: me.oath ? {
+              targetId: me.oath.targetId,
+              revealed: me.oath.revealed,
+              canReveal: canRevealOath(me),
+            } : null,
             privateMessages: me.privateMessages.slice(-10),
-            nightTurnComplete: turnIndex >= 0 && turnIndex < game.nightTurnIndex,
+            nightComplete: game.nightChoices.has(me.id),
+            nightPickCount: nightRole(me) === "Transporter" ? 2 : 1,
+            nightTargetIds: game.phase === "night" && me.alive
+              ? nightTargets(me, nightRole(me)).map(({ id }) => id) : [],
             dayVoteTarget: game.dayVotes[me.id] || null,
             doctorLastSave: game.doctorLastSave[me.id] || null,
           }
@@ -281,12 +292,13 @@ function createRoom(io, code, hostSession, timing, practice = false) {
   }
 
   function emitAll() {
-    for (const player of players.values()) {
-      if (!player.connected || !player.socketId) continue;
-      io.to(player.socketId).emit("state", buildStateFor(player.id));
-    }
+    for (const player of players.values()) emitPlayer(player);
     io.to(tableRoom).emit("tableState", buildTableState());
     if (practice) scheduleBotActions();
+  }
+
+  function emitPlayer(player) {
+    if (player.connected && player.socketId) io.to(player.socketId).emit("state", buildStateFor(player.id));
   }
 
   function detachPlayerSocket(player, message) {
@@ -315,7 +327,7 @@ function createRoom(io, code, hostSession, timing, practice = false) {
 
     const player = existing || {
       id: randomUUID(), sessionId, alive: game.phase === "lobby", role: null,
-      mayorRevealed: false, hunterUsed: false, villagerWatchUsed: false, privateMessages: [],
+      mayorRevealed: false, privateMessages: [],
     };
     player.name = cleanName(name);
     player.connected = true;
@@ -334,10 +346,11 @@ function createRoom(io, code, hostSession, timing, practice = false) {
     emitAll();
   }
 
-  function joinBot(socket, token) {
+  function joinBot(socket, token, automatic) {
     if (!practice || typeof token !== "string" || token.length !== 36 || emptySince !== null) return false;
     const bot = getAllPlayers().find((player) => player.botToken === token);
     if (!bot) return false;
+    if (typeof automatic === "boolean") bot.botAuto = automatic;
     attachPlayerSocket(bot, socket);
     emitAll();
     return true;
@@ -347,7 +360,7 @@ function createRoom(io, code, hostSession, timing, practice = false) {
     const bot = {
       id: randomUUID(), name: `Bot ${nextBotNumber++}`, botToken: randomUUID(), isBot: true,
       connected: true, alive: true, isHost: false, role: null,
-      mayorRevealed: false, hunterUsed: false, villagerWatchUsed: false, privateMessages: [],
+      mayorRevealed: false, privateMessages: [],
     };
     players.set(bot.id, bot);
   }
@@ -405,24 +418,28 @@ function createRoom(io, code, hostSession, timing, practice = false) {
     emitAll();
   }
 
+  function nightRole(player) {
+    return NIGHT_ROLES.has(player.role) && !(ONE_USE_ROLES.has(player.role) && player.abilityUsed)
+      ? player.role : null;
+  }
+
+  function nightTargets(player, role) {
+    return getAlivePlayers().filter((target) => {
+      if (role !== "Doctor" && role !== "Transporter" && target === player) return false;
+      if (role === "Doctor" && game.doctorLastSave[player.id] === target.id) return false;
+      return !["Vampire", "Hunter", "Silencer", "Thief"].includes(role) || player.oath?.targetId !== target.id;
+    });
+  }
+
   function nextBotNightChoice(bot) {
-    const alive = getAlivePlayers();
-    const others = alive.filter((player) => player !== bot);
-    switch (bot.role) {
-      case "Transporter":
-        return alive.length >= 2 ? { targetIds: shuffle(alive).slice(0, 2).map((player) => player.id) } : { skip: true };
-      case "Doctor":
-        return chooseTarget(alive.filter((player) => player.id !== game.doctorLastSave[bot.id]));
-      case "Hunter":
-        return !bot.hunterUsed && randomInt(3) === 0 ? chooseTarget(others) : { skip: true };
-      case "Villager":
-        return bot.villagerWatchUsed ? { skip: true } : chooseTarget(others);
-      case "Vampire":
-      case "Detective":
-        return chooseTarget(others);
-      default:
-        return { skip: true };
+    const role = nightRole(bot);
+    const candidates = nightTargets(bot, role);
+    if (role === "Transporter") {
+      return candidates.length >= 2
+        ? { targetIds: shuffle(candidates).slice(0, 2).map((player) => player.id) } : { skip: true };
     }
+    if (role === "Hunter" && randomInt(3) !== 0) return { skip: true };
+    return chooseTarget(candidates);
   }
 
   function chooseTarget(candidates) {
@@ -431,9 +448,10 @@ function createRoom(io, code, hostSession, timing, practice = false) {
   }
 
   function scheduleBotActions() {
-    const turn = getNightTurn();
-    const botsDue = turn ? isAutomaticBot(getPlayer(turn.playerId))
-      : game.phase === "day" && getAlivePlayers().some((bot) => isAutomaticBot(bot) && !game.dayVotes[bot.id]);
+    const atNight = game.phase === "night";
+    const needsChoice = (bot) => isAutomaticBot(bot)
+      && (atNight ? !game.nightChoices.has(bot.id) : !game.dayVotes[bot.id]);
+    const botsDue = (atNight || game.phase === "day") && getAlivePlayers().some(needsChoice);
     const clock = botsDue && emptySince === null ? game.clock : null;
     if (clock === botClock) return;
 
@@ -441,23 +459,24 @@ function createRoom(io, code, hostSession, timing, practice = false) {
     botClock = clock;
     if (!clock) return;
 
-    const delay = Math.min(turn ? 3200 : 5500, Math.floor((clock.deadline - Date.now()) / 2));
+    const delay = Math.min(atNight ? 4000 : 5500, Math.floor((clock.deadline - Date.now()) / 2));
     botTimer = setTimeout(() => {
       botClock = null;
       if (game.clock !== clock || clock.deadline <= Date.now()) return;
-      if (turn) {
-        const bot = getPlayer(turn.playerId);
-        if (!isAutomaticBot(bot)) return;
-        submitNightAction(bot, { ...nextBotNightChoice(bot), turnKey: turn.key });
-      } else {
-        for (const bot of getAlivePlayers()) {
-          if (!isAutomaticBot(bot) || game.dayVotes[bot.id]) continue;
-          if (game.phase !== "day") break;
+      for (const bot of getAlivePlayers()) {
+        if (game.clock !== clock) break;
+        if (!needsChoice(bot)) continue;
+        if (atNight) {
+          submitNightAction(bot, { ...nextBotNightChoice(bot), nightKey: game.nightKey });
+          emitPlayer(bot);
+        } else {
           revealMayor(bot);
-          submitVote(bot, chooseTarget(getAlivePlayers().filter((player) => player !== bot)).targetId);
+          const candidates = getAlivePlayers().filter((player) => player !== bot && player.id !== bot.oath?.targetId);
+          submitVote(bot, chooseTarget(candidates).targetId);
         }
       }
-      emitAll();
+      if (atNight) scheduleBotActions();
+      else emitAll();
     }, Math.max(50, delay));
   }
 
@@ -498,6 +517,28 @@ function createRoom(io, code, hostSession, timing, practice = false) {
     });
 
     return rolePool;
+  }
+
+  function resetPlayer(player, alive) {
+    Object.assign(player, {
+      role: null, alive, mayorRevealed: false, abilityUsed: false, jesterWon: false,
+      oath: null, publicRole: null, privateMessages: [],
+    });
+  }
+
+  function assignOaths(players) {
+    if (game.oathMode === "off") return;
+    const groups = {
+      "random-town": "Town", town: "Town", evil: "Evil",
+    };
+    const faction = groups[game.oathMode];
+    let selected = players.filter((player) => faction ? alignment(player.role) === faction
+      : game.oathMode !== "non-evil" || !EVIL_ROLES.has(player.role));
+    if (game.oathMode.startsWith("random-")) selected = shuffle(selected).slice(0, 1);
+    for (const player of selected) {
+      player.oath = { targetId: null, shieldNight: null, revealed: false };
+      pushPrivateMessage(player.id, "You have the Accuser’s Oath. Open your private role card to read it.");
+    }
   }
 
   function startGame(socket) {
@@ -541,23 +582,14 @@ function createRoom(io, code, hostSession, timing, practice = false) {
     game.tableCues = [];
     game.gameOver = null;
 
-    for (const player of players.values()) {
-      player.role = null;
-      player.alive = false;
-      player.mayorRevealed = false;
-      player.hunterUsed = false;
-      player.villagerWatchUsed = false;
-      player.privateMessages = [];
-    }
+    for (const player of players.values()) resetPlayer(player, false);
 
     shuffledPlayers.forEach((player, index) => {
       player.role = shuffledRoles[index];
       player.alive = true;
-      player.mayorRevealed = false;
-      player.hunterUsed = false;
-      player.privateMessages = [];
     });
 
+    assignOaths(shuffledPlayers);
     startNight();
   }
 
@@ -569,22 +601,16 @@ function createRoom(io, code, hostSession, timing, practice = false) {
         continue;
       }
 
-      player.role = null;
-      player.alive = true;
-      player.mayorRevealed = false;
-      player.hunterUsed = false;
-      player.villagerWatchUsed = false;
-      player.privateMessages = [];
+      resetPlayer(player, true);
     }
 
     game.phase = "lobby";
     game.hasStarted = false;
     game.dayNumber = 0;
     game.nightNumber = 0;
-    game.nightActions = makeEmptyNightActions();
-    game.nightTurns = [];
-    game.nightTurnIndex = 0;
-    game.nightCycle = null;
+    game.nightChoices.clear();
+    game.nightKey = null;
+    game.pendingThefts = [];
     game.dayVotes = {};
     game.doctorLastSave = {};
     game.detectiveMemory = {};
@@ -607,11 +633,16 @@ function createRoom(io, code, hostSession, timing, practice = false) {
         role: player.role || "No role",
         alive: player.alive,
         connected: player.connected,
+        won: player.jesterWon || (Boolean(player.role) && player.role !== "Jester"
+          && (winner === "Vampires" && EVIL_ROLES.has(player.role)
+            || winner === "Villagers" && !EVIL_ROLES.has(player.role))),
+        rule: player.oath?.revealed ? "Accuser’s Oath" : null,
       })),
     };
 
     pushMessage(`Game over: ${winner}. ${reason}`);
-    announceToTable(winner === "No winner" ? "The host ended the game." : `Game over. Winner: ${winner}.`);
+    announceToTable(winner === "No winner" ? "The host ended the game."
+      : winner === "Draw" ? `The game ends in a draw. ${reason}` : `Game over. Winner: ${winner}.`);
   }
 
   // Win condition checks
@@ -619,68 +650,55 @@ function createRoom(io, code, hostSession, timing, practice = false) {
     if (!game.hasStarted || game.phase === "gameover") return true;
 
     const alive = getAlivePlayers();
-    const aliveVampires = alive.filter((player) => player.role === "Vampire");
-    const aliveNonVampires = alive.filter((player) => player.role !== "Vampire");
-
-    if (aliveVampires.length === 0) {
+    if (!alive.some((player) => player.role === "Vampire")) {
       setGameOver("Villagers", "All vampires are dead.");
       return true;
     }
 
-    if (aliveVampires.length >= aliveNonVampires.length) {
-      setGameOver("Vampires", "Alive vampires are equal to or greater than alive non-vampires.");
+    const evilCount = alive.filter((player) => EVIL_ROLES.has(player.role)).length;
+    if (evilCount >= alive.length - evilCount) {
+      setGameOver("Vampires", "The living evil team reached parity.");
       return true;
     }
 
     return false;
   }
 
-  // Night action helpers
+  function applyRoleThefts() {
+    for (const { thiefId, targetId } of game.pendingThefts) {
+      const thief = getPlayer(thiefId);
+      const target = getPlayer(targetId);
+      if (!thief.alive) continue;
+      if (!target.alive) {
+        pushPrivateMessage(thiefId, "Your target died before the role could transfer. The steal was spent.");
+        continue;
+      }
+      thief.role = target.role;
+      thief.abilityUsed = target.abilityUsed || target.role === "Thief";
+      target.role = "Villager";
+      target.abilityUsed = false;
+      target.mayorRevealed = false;
+      if (thief.role === "Doctor") game.doctorLastSave[thiefId] = game.doctorLastSave[targetId];
+      delete game.doctorLastSave[targetId];
+      delete game.detectiveMemory[targetId];
+      pushPrivateMessage(thiefId, `You stole ${target.name}’s role. Your new role is ${thief.role}.`);
+      pushPrivateMessage(targetId, "Your role was stolen. You are now a Villager.");
+    }
+    game.pendingThefts = [];
+  }
+
   function startNight() {
+    applyRoleThefts();
     game.phase = "night";
     game.nightNumber += 1;
-    game.nightActions = makeEmptyNightActions();
+    game.nightChoices.clear();
     game.dayVotes = {};
-    game.nightTurns = shuffle(getAlivePlayers()).map((player) => player.id);
-    game.nightTurnIndex = 0;
-    game.nightCycle = randomUUID();
+    game.nightKey = randomUUID();
 
-    const message = `Night ${game.nightNumber} begins. Wait for your name before opening your turn.`;
+    const message = `Night ${game.nightNumber}. Everyone has ${Math.ceil(timing.night / 1000)} seconds to make a private choice.`;
     pushMessage(message);
     announceToTable(message);
-    announceNightTurn();
-  }
-
-  function announceNightTurn() {
-    const turn = getNightTurn();
-    if (!turn) return;
-    announceToTable(`${getPlayerName(turn.playerId)}, it's your turn.`, turn.key);
-    startClock(timing.night, advanceNightTurn);
-  }
-
-  function advanceNightTurn() {
-    game.nightTurnIndex += 1;
-    if (getNightTurn()) announceNightTurn();
-    else resolveNight();
-  }
-
-  function buildTransporterPairs(actions) {
-    const pairs = [];
-
-    Object.entries(actions.transporters).forEach(([transporterId, action]) => {
-      const transporter = getPlayer(transporterId);
-      if (!transporter?.alive || transporter.role !== "Transporter") return;
-      if (action.skip) return;
-      if (!Array.isArray(action.targetIds) || action.targetIds.length !== 2) return;
-
-      const [firstId, secondId] = action.targetIds;
-      if (firstId === secondId) return;
-      if (!isAlive(firstId) || !isAlive(secondId)) return;
-
-      pairs.push([firstId, secondId]);
-    });
-
-    return pairs;
+    startClock(timing.night, resolveNight);
   }
 
   function remapTarget(playerId, transporterPairs) {
@@ -706,122 +724,108 @@ function createRoom(io, code, hostSession, timing, practice = false) {
     return { targetId: topTargets[0][0], tied: false };
   }
 
-  // Night resolution
+function nightMoves() {
+    return shuffle(getAlivePlayers()).flatMap((player) => {
+      const choice = game.nightChoices.get(player.id);
+      const role = choice?.guess ? "Seer" : nightRole(player);
+      if (!role || !choice || choice.skip || choice.oath) return [];
+      return [{ player, role, ...choice }];
+    });
+  }
+
+  function blockNightMoves(moves) {
+    const blocked = new Set();
+    for (const { player, role, targetId } of moves) {
+      if (role !== "Silencer" || blocked.has(player.id)) continue;
+      player.abilityUsed = true;
+      blocked.add(targetId);
+    }
+    for (const { player, role } of moves) {
+      if (role !== "Silencer" && blocked.has(player.id)) pushPrivateMessage(player.id, "Your night action was blocked.");
+    }
+
+    // Blocks resolve first. Each player can be involved in at most one theft that night.
+    const theftParticipants = new Set();
+    for (const { player, role, targetId } of moves) {
+      if (role !== "Thief" || blocked.has(player.id)) continue;
+      if (theftParticipants.has(player.id) || theftParticipants.has(targetId)) continue;
+      theftParticipants.add(player.id);
+      theftParticipants.add(targetId);
+      blocked.add(targetId);
+      player.abilityUsed = true;
+      game.pendingThefts.push({ thiefId: player.id, targetId });
+    }
+    return blocked;
+  }
+
+  function reportInvestigation(detective, target) {
+    if (!EVIL_ROLES.has(target.role)) {
+      pushPrivateMessage(detective.id, `${target.name} is not evil.`);
+      return;
+    }
+    const memory = game.detectiveMemory[detective.id] ??= {};
+    const previous = memory[target.id];
+    memory[target.id] = target.role;
+    pushPrivateMessage(detective.id, previous === target.role
+      ? `${target.name}’s exact role is ${target.role}.` : `${target.name} seems suspicious.`);
+  }
+
+  function hunterShot(hunter, target) {
+    hunter.abilityUsed = true;
+    return target.role === "Vampire" ? [target.id] : [target.id, hunter.id];
+  }
+
   function resolveNight() {
     if (game.phase !== "night") return;
     stopClock();
 
-    const roleCues = Object.keys(NIGHT_ACTIONS)
-      .filter((role) => game.roleConfig[role].enabled && game.roleConfig[role].count > 0)
-      .map((role) => `${role} turn closed.`);
-    if (roleCues.length) announceToTable(roleCues.join(" "));
-
-    const actions = game.nightActions;
-    const transporterPairs = buildTransporterPairs(actions);
-    const savedTargets = new Set();
-    const deathSet = new Set();
-
-    Object.entries(actions.doctors).forEach(([doctorId, action]) => {
-      const doctor = getPlayer(doctorId);
-      if (!doctor?.alive || doctor.role !== "Doctor") return;
-
-      if (action.skip || !action.targetId) {
-        game.doctorLastSave[doctorId] = null;
-        return;
-      }
-
-      if (game.doctorLastSave[doctorId] === action.targetId) return;
-      if (!isAlive(action.targetId)) return;
-
-      const actualSaveTarget = remapTarget(action.targetId, transporterPairs);
-      if (isAlive(actualSaveTarget)) {
-        savedTargets.add(actualSaveTarget);
-        game.doctorLastSave[doctorId] = action.targetId;
-      }
-    });
-
-    Object.entries(actions.detectives).forEach(([detectiveId, action]) => {
-      const detective = getPlayer(detectiveId);
-      if (!detective?.alive || detective.role !== "Detective") return;
-      if (action.skip || !action.targetId) return;
-      if (!isAlive(action.targetId)) return;
-
-      const actualTargetId = remapTarget(action.targetId, transporterPairs);
-      const target = getPlayer(actualTargetId);
-      if (!target?.alive) return;
-
-      const isEvil = target.role === "Vampire" || target.role === "Jester";
-
-      if (!isEvil) {
-        pushPrivateMessage(detectiveId, `${target.name} is not evil.`);
-        return;
-      }
-
-      if (!game.detectiveMemory[detectiveId]) game.detectiveMemory[detectiveId] = {};
-      const previousChecks = game.detectiveMemory[detectiveId][actualTargetId] || 0;
-      const newChecks = previousChecks + 1;
-      game.detectiveMemory[detectiveId][actualTargetId] = newChecks;
-
-      if (newChecks === 1) {
-        pushPrivateMessage(detectiveId, `${target.name} seems suspicious.`);
-      } else {
-        pushPrivateMessage(detectiveId, `${target.name}'s exact role is ${target.role}.`);
-      }
-    });
-
-    Object.entries(actions.hunters).forEach(([hunterId, action]) => {
-      const hunter = getPlayer(hunterId);
-      if (!hunter?.alive || hunter.role !== "Hunter" || hunter.hunterUsed) return;
-      if (action.skip || !action.targetId) return;
-      if (!isAlive(action.targetId)) return;
-
-      const actualTargetId = remapTarget(action.targetId, transporterPairs);
-      const target = getPlayer(actualTargetId);
-      if (!target?.alive) return;
-
-      hunter.hunterUsed = true;
-      deathSet.add(actualTargetId);
-      if (target.role !== "Vampire") deathSet.add(hunterId);
-    });
-
+    const moves = nightMoves();
+    const blocked = blockNightMoves(moves);
+    const active = moves.filter(({ player }) => !blocked.has(player.id));
+    const pairs = active.filter(({ role }) => role === "Transporter").map(({ targetIds }) => targetIds);
+    const saves = new Set();
+    const oathSaves = new Set(getAlivePlayers()
+      .filter((player) => player.oath?.shieldNight === game.nightNumber && !blocked.has(player.id))
+      .map((player) => player.oath.targetId));
+    const deaths = new Set();
+    const forcedDeaths = new Set();
     const vampireTally = {};
+    game.doctorLastSave = {};
 
-    Object.entries(actions.vampires).forEach(([vampireId, action]) => {
-      const vampire = getPlayer(vampireId);
-      if (!vampire?.alive || vampire.role !== "Vampire") return;
-      if (action.skip) return;
-      if (!action.targetId || !isAlive(action.targetId)) return;
-
-      const actualTargetId = remapTarget(action.targetId, transporterPairs);
-      if (!isAlive(actualTargetId)) return;
-
-      vampireTally[actualTargetId] = (vampireTally[actualTargetId] || 0) + 1;
-    });
-
-    const vampirePick = getTopTargetFromTally(vampireTally);
-    if (vampirePick.targetId && !savedTargets.has(vampirePick.targetId)) deathSet.add(vampirePick.targetId);
-
-    for (const playerId of deathSet) {
-      const player = getPlayer(playerId);
-      if (player?.alive) player.alive = false;
+    for (const { player, role, targetId, guess } of active) {
+      if (!targetId) continue;
+      if (role === "Seer") {
+        if (!resolveSeerGuess(player, getPlayer(targetId), guess)) forcedDeaths.add(player.id);
+        continue;
+      }
+      const target = getPlayer(remapTarget(targetId, pairs));
+      if (role === "Doctor") {
+        saves.add(target.id);
+        game.doctorLastSave[player.id] = targetId;
+      } else if (role === "Detective") {
+        reportInvestigation(player, target);
+      } else if (role === "Hunter" && target.id !== player.oath?.targetId) {
+        const [victim, recoil] = hunterShot(player, target);
+        deaths.add(victim);
+        if (recoil) forcedDeaths.add(recoil);
+      } else if (role === "Vampire" && target.id !== player.oath?.targetId) {
+        vampireTally[target.id] = (vampireTally[target.id] || 0) + 1;
+      }
     }
 
-    const moved = new Set(Object.values(NIGHT_ACTIONS).flatMap((group) => Object.entries(actions[group])
-      .filter(([, action]) => !action.skip)
-      .map(([id]) => id)));
-    for (const [observerId, targetId] of Object.entries(actions.watches)) {
-      if (!isAlive(observerId)) continue;
-      const result = moved.has(targetId) ? "made a targeted move" : "made no targeted move";
-      pushPrivateMessage(observerId, `You saw that ${getPlayerName(targetId)} ${result} last night.`);
-    }
+    const vampirePick = getTopTargetFromTally(vampireTally).targetId;
+    if (vampirePick && !saves.has(vampirePick)) deaths.add(vampirePick);
+    for (const id of oathSaves) deaths.delete(id);
+    for (const id of forcedDeaths) deaths.add(id);
+    for (const id of deaths) eliminate(getPlayer(id));
 
-    const names = [...deathSet].map(getPlayerName);
+    const names = [...deaths].map(getPlayerName);
     const outcome = names.length ? `Lost overnight: ${names.join(", ")}.` : "Everyone survived the night.";
     pushMessage(outcome);
     announceToTable(outcome);
+    for (const id of deaths) revealOath(getPlayer(id));
 
-    game.nightActions = makeEmptyNightActions();
-
+    game.nightChoices.clear();
     if (checkWinConditions()) return;
 
     game.phase = "day";
@@ -837,6 +841,12 @@ function createRoom(io, code, hostSession, timing, practice = false) {
     const aliveIds = getAlivePlayers().map((player) => player.id);
     if (aliveIds.length === 0) return false;
     return aliveIds.every((playerId) => game.dayVotes[playerId]);
+  }
+
+  function isDeadlock() {
+    if (!game.deadlockDraw || !allDayVotesSubmitted()) return false;
+    const roles = getAlivePlayers().map((player) => player.role);
+    return roles.length === 3 && ["Vampire", "Jester", "Villager"].every((role) => roles.includes(role));
   }
 
   function resolveVotes() {
@@ -855,20 +865,24 @@ function createRoom(io, code, hostSession, timing, practice = false) {
 
     const voteResult = getTopTargetFromTally(tally);
 
+    if (voteResult.tied && isDeadlock()) {
+      setGameOver("Draw", "The Vampire, Jester and Villager each received one vote.");
+      return;
+    }
     if (!voteResult.targetId || voteResult.tied) {
-      pushMessage("The vote tied. No one was eliminated.");
-      announceToTable("The vote tied. No one was eliminated.");
+      const message = voteResult.tied ? "The vote tied. No one was eliminated." : "No votes were cast. No one was eliminated.";
+      pushMessage(message);
+      announceToTable(message);
     } else {
       const eliminated = getPlayer(voteResult.targetId);
       if (eliminated?.alive) {
-        eliminated.alive = false;
-        pushMessage(`${eliminated.name} was voted out.`);
-        announceToTable(`${eliminated.name} was voted out.`);
-
-        if (eliminated.role === "Jester") {
-          setGameOver("Jester", `${eliminated.name} was voted out and wins immediately.`);
-          return;
-        }
+        eliminated.jesterWon = eliminated.role === "Jester";
+        eliminate(eliminated);
+        const outcome = eliminated.jesterWon
+          ? `${eliminated.name} was voted out and earned a Jester win.` : `${eliminated.name} was voted out.`;
+        pushMessage(outcome);
+        announceToTable(outcome);
+        revealOath(eliminated);
       }
     }
 
@@ -877,56 +891,141 @@ function createRoom(io, code, hostSession, timing, practice = false) {
     startNight();
   }
 
+function activeMatch() {
+    return game.phase === "day" || game.phase === "night";
+  }
+
+  function canAct(player) {
+    return Boolean(player?.alive && activeMatch() && Date.now() < game.clock?.deadline);
+  }
+
+  function eliminate(player) {
+    player.alive = false;
+    delete game.dayVotes[player.id];
+    for (const [voter, target] of Object.entries(game.dayVotes)) {
+      if (target === player.id) delete game.dayVotes[voter];
+    }
+  }
+
+  function canRevealOath(player) {
+    if (!player.oath || player.oath.revealed || !canAct(player)) return false;
+    const living = getAlivePlayers();
+    const vampires = living.filter(({ role }) => role === "Vampire").length;
+    const lostAccuser = player.oath.targetId && !isAlive(player.oath.targetId);
+    return Boolean(lostAccuser || living.length <= 2 * vampires + 2);
+  }
+
+  function revealOath(player) {
+    const oath = player.oath;
+    if (!oath || oath.revealed) return;
+    oath.revealed = true;
+    const detail = oath.targetId ? ` They vowed to protect ${getPlayerName(oath.targetId)}, their first accuser.`
+      : " It required them to protect the first person who accused them of being a Vampire.";
+    const message = `${player.name} had the Accuser’s Oath.${detail}`;
+    pushMessage(message);
+    announceToTable(message);
+  }
+
+  function recordAccuser(player, targetId) {
+    if (!canAct(player) || !player.oath || player.oath.targetId) return "This oath is no longer available.";
+    if (player.id === targetId || !isAlive(targetId)) return "Choose another living player.";
+    player.oath.targetId = targetId;
+    player.oath.shieldNight = game.phase === "night" ? game.nightNumber : game.nightNumber + 1;
+    if (game.dayVotes[player.id] === targetId) delete game.dayVotes[player.id];
+    return null;
+  }
+
   function submitNightAction(player, payload) {
-    const turn = getNightTurn();
-    if (!player?.alive || !turn || turn.playerId !== player.id || turn.key !== payload?.turnKey || Date.now() >= game.clock?.deadline) {
-      return "This turn is no longer available. Check the current turn on your screen.";
+    if (!canAct(player) || game.phase !== "night" || payload?.nightKey !== game.nightKey) {
+      return "The night has closed.";
     }
 
-    const { role, id: playerId } = player;
-    const { targetId, targetIds } = payload;
-    const skip = payload.skip === true;
-    const group = player.hunterUsed && role === "Hunter" ? null : NIGHT_ACTIONS[role];
-    if (role === "Vampire" && skip && !game.vampireCanSkip) return "The host has disabled skipping for Vampires.";
+    const previous = game.nightChoices.get(player.id);
+    if (payload.oath === true && !previous?.guess) {
+      const error = recordAccuser(player, payload.targetId);
+      if (!error) game.nightChoices.set(player.id, { oath: true });
+      return error;
+    }
+    if (previous) return "Your choice is already locked in.";
 
+    const role = nightRole(player);
+    const targets = nightTargets(player, role);
+    const { targetId, targetIds } = payload;
+    if (payload.skip === true) {
+      if (role === "Vampire" && !game.vampireCanSkip && targets.length) return "Choose an available player.";
+      game.nightChoices.set(player.id, { skip: true });
+      return null;
+    }
+
+    const valid = (id) => targets.some((target) => target.id === id);
     if (role === "Transporter") {
-      const pair = Array.isArray(targetIds) ? targetIds : [];
-      if (!skip && (pair.length !== 2 || pair[0] === pair[1] || !pair.every(isAlive))) {
+      if (!Array.isArray(targetIds) || targetIds.length !== 2 || targetIds[0] === targetIds[1] || !targetIds.every(valid)) {
         return "Choose two different living players.";
       }
-      game.nightActions[group][playerId] = { skip, targetIds: skip ? [] : pair };
+      game.nightChoices.set(player.id, { targetIds });
     } else {
-      if (!skip && (!isAlive(targetId) || (targetId === playerId && role !== "Doctor"))) {
-        return "Choose an available player.";
-      }
-      if (role === "Doctor" && !skip && game.doctorLastSave[playerId] === targetId) {
-        return "You cannot save the same player two nights in a row.";
-      }
-      if (group) game.nightActions[group][playerId] = { skip, targetId: skip ? null : targetId };
-      else if (!skip && role === "Villager" && !player.villagerWatchUsed) {
-        player.villagerWatchUsed = true;
-        game.nightActions.watches[playerId] = targetId;
-      }
+      if (!valid(targetId)) return "Choose an available player.";
+      game.nightChoices.set(player.id, { targetId });
     }
-
-    advanceNightTurn();
     return null;
   }
 
   function revealMayor(player) {
-    if (!player?.alive || player.role !== "Mayor" || player.mayorRevealed || game.phase !== "day") return false;
+    if (!canAct(player) || player.role !== "Mayor" || player.mayorRevealed) return false;
     player.mayorRevealed = true;
-    pushMessage(`${player.name} has revealed as the Mayor! Their vote now counts as 2.`);
+    const message = `${player.name} revealed as Mayor. Their vote counts as two.`;
+    pushMessage(message);
+    announceToTable(message);
     return true;
   }
 
   function submitVote(voter, targetId) {
-    if (!voter?.alive || game.phase !== "day" || Date.now() >= game.clock?.deadline) return false;
-    if (!isAlive(targetId) || targetId === voter.id) return false;
+    if (!canAct(voter) || game.phase !== "day") return false;
+    if (!isAlive(targetId) || targetId === voter.id || voter.oath?.targetId === targetId) return false;
 
     game.dayVotes[voter.id] = targetId;
     if (allDayVotesSubmitted()) resolveVotes();
     return true;
+  }
+
+  function resolveSeerGuess(seer, target, guess) {
+    seer.abilityUsed = true;
+    if (target.role !== guess) {
+      pushPrivateMessage(seer.id, "Your guess was wrong.");
+      return false;
+    }
+
+    seer.publicRole = "Seer";
+    target.publicRole = target.role;
+    const message = `${seer.name} is the Seer and revealed that ${target.name} is a ${target.role}.`;
+    pushMessage(message);
+    announceToTable(message);
+    const remaining = seerTargets(seer).filter((player) => player !== target).map(({ name }) => name);
+    if (remaining.length) pushPrivateMessage(seer.id, `You cannot say these players have a role: ${remaining.join(", ")}.`);
+    return true;
+  }
+
+  function submitSeerGuess(seer, payload) {
+    if (!canAct(seer) || seer.role !== "Seer" || seer.abilityUsed) return "Your guess is no longer available.";
+    const { targetId, guess } = payload || {};
+    const target = seerTargets(seer).find(({ id }) => id === targetId);
+    if (!target || !ROLE_ORDER.includes(guess) || guess === "Villager") return "Choose a highlighted player and a role.";
+    if (game.phase === "night") {
+      const previous = game.nightChoices.get(seer.id);
+      if (payload.nightKey !== game.nightKey || previous?.guess || previous?.oath) return "Your choice is already locked or the night has closed.";
+      game.nightChoices.set(seer.id, { targetId, guess });
+    } else {
+      if (payload.nightKey) return "The night has closed.";
+      if (!resolveSeerGuess(seer, target, guess)) {
+        eliminate(seer);
+        const message = `${seer.name} died.`;
+        pushMessage(message);
+        announceToTable(message);
+        revealOath(seer);
+        checkWinConditions();
+      }
+    }
+    return null;
   }
 
   const handlers = {
@@ -963,7 +1062,7 @@ function createRoom(io, code, hostSession, timing, practice = false) {
     updateConfig(socket, payload) {
       if (!isHostSocket(socket)) return;
       if (game.phase !== "lobby") return;
-      const { role, enabled, count, vampireCanSkip } = payload || {};
+      const { role, enabled, count, vampireCanSkip, oathMode, deadlockDraw } = payload || {};
 
       if (ROLE_ORDER.includes(role)) {
         game.roleConfig[role] = {
@@ -975,6 +1074,8 @@ function createRoom(io, code, hostSession, timing, practice = false) {
       if (typeof vampireCanSkip === "boolean") {
         game.vampireCanSkip = vampireCanSkip;
       }
+      if (OATH_MODES.includes(oathMode)) game.oathMode = oathMode;
+      if (typeof deadlockDraw === "boolean") game.deadlockDraw = deadlockDraw;
 
       emitAll();
     },
@@ -1011,18 +1112,57 @@ function createRoom(io, code, hostSession, timing, practice = false) {
       emitAll();
     },
 
-    skipNightTurn(socket, turnKey) {
-      const turn = getNightTurn();
-      if (!isHostSocket(socket) || !turn || turn.key !== turnKey) return;
-      advanceNightTurn();
-      emitAll();
-    },
-
     nightAction(socket, payload, acknowledge) {
       const player = getPlayer(socketToPlayerId.get(socket.id));
       const error = isAutomaticBot(player) ? "Take control before choosing an action." : submitNightAction(player, payload);
-      if (!error) emitAll();
+      if (!error) emitPlayer(player);
       if (typeof acknowledge === "function") acknowledge(error);
+    },
+
+    recordAccuser(socket, targetId) {
+      const player = getPlayer(socketToPlayerId.get(socket.id));
+      if (isAutomaticBot(player) || game.phase !== "day") return;
+      const error = recordAccuser(player, targetId);
+      if (error) return sendError(socket, error);
+      emitAll();
+    },
+
+    revealOath(socket) {
+      const player = getPlayer(socketToPlayerId.get(socket.id));
+      if (!player || isAutomaticBot(player) || !canRevealOath(player)) return;
+      revealOath(player);
+      emitAll();
+    },
+
+    seerGuess(socket, payload, acknowledge) {
+      const player = getPlayer(socketToPlayerId.get(socket.id));
+      const atNight = game.phase === "night";
+      const error = isAutomaticBot(player) ? "Take control before guessing." : submitSeerGuess(player, payload);
+      if (!error) {
+        if (atNight) emitPlayer(player);
+        else emitAll();
+      }
+      if (typeof acknowledge === "function") acknowledge(error);
+    },
+
+    hunterShot(socket, targetId) {
+      const hunter = getPlayer(socketToPlayerId.get(socket.id));
+      if (!canAct(hunter) || game.phase !== "day" || isAutomaticBot(hunter)
+        || hunter.role !== "Hunter" || hunter.abilityUsed) return;
+      const target = getPlayer(targetId);
+      if (!target?.alive || target === hunter || target.id === hunter.oath?.targetId) {
+        return sendError(socket, "Choose an available player.");
+      }
+      const victims = hunterShot(hunter, target).map(getPlayer);
+      const message = `A shot rang out. ${victims.map(({ name }) => name).join(" and ")} died.`;
+      pushMessage(message);
+      announceToTable(message);
+      for (const victim of victims) {
+        eliminate(victim);
+        revealOath(victim);
+      }
+      if (!checkWinConditions() && allDayVotesSubmitted()) resolveVotes();
+      emitAll();
     },
 
     revealMayor(socket) {

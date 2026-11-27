@@ -6,17 +6,28 @@ let state = null;
 let selectedTransporterTargets = [];
 let joinDetails = null;
 let privateView = false;
+let roleRevealed = false;
+let choosingAccuser = false;
+let choosingShot = false;
+let seerTargetId = null;
+let seerGuessRole = "";
+let pendingDayChoice = null;
 let pendingNightChoice = null;
 let savingTurn = false;
 let roomMode = "create";
 let botDeskOpen = true;
+let boardOpen = false;
 const botWindows = new Map();
+const boardPlayers = new Map();
 
 const invitedRoom = new URLSearchParams(location.search).get("room")?.toUpperCase() || "";
 const botToken = new URLSearchParams(location.hash.slice(1)).get("bot");
-const isBotWindow = botToken !== null;
+const inBoard = location.pathname === "/practice/player";
+const isBotWindow = inBoard || botToken !== null;
 let connectBot = isBotWindow;
+let firstBotJoin = true;
 const playerId = isBotWindow ? null : getPlayerId();
+if (inBoard) document.body.classList.add("board-player");
 
 function getPlayerId() {
   const storedId = localStorage.getItem("vampirePlayerId");
@@ -141,7 +152,10 @@ $("join-form").addEventListener("submit", (event) => {
 });
 
 socket.on("connect", () => {
-  if (connectBot) socket.emit("joinBot", { code: invitedRoom, token: botToken });
+  if (connectBot) {
+    socket.emit("joinBot", { code: invitedRoom, token: botToken, automatic: firstBotJoin ? inBoard : undefined });
+    firstBotJoin = false;
+  }
   else if (joinDetails?.code) socket.emit("join", joinDetails);
 });
 
@@ -151,11 +165,51 @@ function roomLink(path = "/") {
   return url.href;
 }
 
-function botLink(bot) {
-  const url = new URL(roomLink());
+function botLink(bot, path = "/") {
+  const url = new URL(roomLink(path));
   url.hash = new URLSearchParams({ bot: bot.token }).toString();
   return url.href;
 }
+
+function syncBotBoard() {
+  const bots = boardOpen ? state?.bots || [] : [];
+  const active = bots.length > 0;
+  $("practice-board").classList.toggle("hidden", !active);
+  document.body.classList.toggle("has-practice-board", active);
+
+  const byId = new Map(bots.map((bot) => [bot.id, bot]));
+  for (const [id, pane] of boardPlayers) {
+    if (byId.get(id)?.token === pane.token) continue;
+    pane.root.remove();
+    boardPlayers.delete(id);
+  }
+
+  for (const bot of bots) {
+    let pane = boardPlayers.get(bot.id);
+    if (!pane) {
+      const popup = botWindows.get(bot.id)?.popup;
+      if (popup && !popup.closed) popup.close();
+      botWindows.delete(bot.id);
+
+      const root = document.createElement("section");
+      root.className = "board-tile";
+      const heading = document.createElement("h3");
+      const frame = document.createElement("iframe");
+      frame.title = `${bot.name} player view`;
+      frame.src = botLink(bot, "/practice/player");
+      root.append(heading, frame);
+      $("board-grid").append(root);
+      pane = { root, heading, token: bot.token };
+      boardPlayers.set(bot.id, pane);
+    }
+    pane.heading.textContent = bot.name;
+  }
+}
+
+$("close-board").addEventListener("click", () => {
+  boardOpen = false;
+  render();
+});
 
 function openBotWindow(event) {
   if (event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
@@ -168,7 +222,14 @@ function openBotWindow(event) {
     return;
   }
 
-  const popup = window.open(href, `vampire-bot-${botId}`, "popup,width=460,height=760");
+  const index = state.bots.findIndex((bot) => bot.id === botId);
+  const columns = Math.max(1, Math.floor(screen.availWidth / 400));
+  const width = Math.min(460, Math.floor(screen.availWidth / columns));
+  const rows = Math.ceil(state.bots.length / columns);
+  const height = Math.min(760, Math.max(320, Math.floor(screen.availHeight / rows) - 38));
+  const left = (screen.availLeft ?? 0) + (index % columns) * width;
+  const top = (screen.availTop ?? 0) + Math.floor(index / columns) * (height + 38);
+  const popup = window.open(href, `vampire-bot-${botId}`, `popup,width=${width},height=${height},left=${left},top=${top}`);
   if (!popup) return showToast("Allow pop-ups or open this bot link in a new tab.");
   popup.opener = null;
   botWindows.set(botId, { href, popup });
@@ -203,6 +264,9 @@ function returnToRooms(message) {
 
   state = null;
   joinDetails = null;
+  boardOpen = false;
+  syncBotBoard();
+  resetPrivateView();
   gameClock.set(null);
   sessionStorage.removeItem("vampireRoom");
   const url = new URL(location.href);
@@ -239,7 +303,7 @@ function showTransition(title, symbol, kind = "phase") {
 }
 
 document.addEventListener("visibilitychange", () => {
-  if (document.hidden && privateView) hidePrivateView();
+  if (document.hidden && (privateView || roleRevealed)) hidePrivateView();
 });
 
 // ##################################### 4
@@ -251,6 +315,7 @@ function render() {
   if (existingDesk) botDeskOpen = existingDesk.open;
   $("join-screen").classList.add("hidden");
   $("bot-entry").classList.add("hidden");
+  syncBotBoard();
   document.body.dataset.phase = state.phase;
   $("room-label").textContent = `Room ${state.roomCode}`;
   const atNight = state.phase === "night";
@@ -283,34 +348,33 @@ function render() {
 }
 
 function renderNightScreen() {
-  const turn = state.nightTurn;
-  const active = turn ? findPlayer(turn.playerId) : null;
-  const yourTurn = active?.id === state.me.id;
-  const isOpen = yourTurn && privateView && !savingTurn;
-  let heading = "Wait for your turn";
-  if (yourTurn) heading = "It's your turn";
+  const choosing = privateView && state.me.alive && !state.me.botAuto && !state.me.nightComplete && !savingTurn;
+  let heading = "Make a private choice";
   if (savingTurn) heading = "Saving your choice…";
-  if (state.me.nightTurnComplete) heading = "Turn complete";
+  if (state.me.nightComplete) heading = "Choice locked";
   if (!state.me.alive) heading = "Watching the game";
 
   $("night-panel").innerHTML = `
+    ${renderBotControls()}
     <section class="card night-cover">
       <span class="phase-glyph" aria-hidden="true">☾</span>
-      <p class="round-label">Night ${state.nightNumber}${turn ? ` · Turn ${turn.number} of ${turn.total}` : ""}</p>
-      <h1>${isOpen ? "Your private turn" : heading}</h1>
-      ${isOpen ? `<button id="hide-private-btn" class="secondary">Cover screen</button>`
-        : `<p>${yourTurn ? "Open your turn to make a choice." : active ? `${escapeHtml(active.name)}${active.connected ? " is taking their turn." : " is reconnecting."}` : "The night is ending."}</p>
-          ${yourTurn && !savingTurn ? `<button id="show-private-btn" class="primary">${state.me.botAuto ? "View private turn" : "Open my turn"}</button>` : ""}`}
-      ${gameClock.markup("Turn ends in")}
+      <p class="round-label">Night ${state.nightNumber}</p>
+      <h1>${heading}</h1>
+      ${gameClock.markup("Night ends in")}
+      <div class="night-options">
+        ${choosing ? `<button id="hide-private-btn" class="secondary">Cover screen</button>` : ""}
+        ${state.me.alive && !state.me.nightComplete && !state.me.botAuto && !savingTurn && !choosing
+          ? `<button id="show-private-btn" class="primary">Make choice</button>` : ""}
+        ${state.me.role && !roleRevealed ? `<button id="show-role-btn" class="secondary">Reveal role</button>` : ""}
+      </div>
     </section>
-    ${renderBotControls()}
-    ${isOpen ? `${renderRoleCard()}${state.me.botAuto ? "" : pendingNightChoice ? renderNightConfirmation() : renderNightActions()}` : ""}
-    ${renderBotDesk()}
-    ${!isOpen && state.me.isHost ? `
+    ${roleRevealed ? renderRoleCard() : ""}
+    ${choosing ? (pendingNightChoice ? renderNightConfirmation() : renderNightActions()) : ""}
+    ${!choosing && !roleRevealed ? renderBotDesk() : ""}
+    ${!choosing && !roleRevealed && state.me.isHost ? `
       <details class="card night-host">
         <summary>Host controls</summary>
         <div class="button-grid">
-          <button id="skip-night-btn" class="secondary" ${active ? "" : "disabled"}>Skip current turn</button>
           <button id="resolve-night-btn" class="secondary">End night early</button>
           <button id="end-game-btn" class="secondary">End game</button>
         </div>
@@ -318,10 +382,20 @@ function renderNightScreen() {
   `;
 }
 
-function hidePrivateView() {
+function resetPrivateView() {
   privateView = false;
+  roleRevealed = false;
+  choosingAccuser = false;
+  choosingShot = false;
+  seerTargetId = null;
+  seerGuessRole = "";
+  pendingDayChoice = null;
   pendingNightChoice = null;
   selectedTransporterTargets = [];
+}
+
+function hidePrivateView() {
+  resetPrivateView();
   render();
 }
 
@@ -351,6 +425,8 @@ function renderPlayerList() {
       const tags = [];
       if (player.isHost) tags.push("HOST");
       if (player.isBot) tags.push("BOT");
+      if (player.jesterWon) tags.push("Jester win");
+      if (state.phase !== "gameover" && player.publicRole) tags.push(`Revealed ${player.publicRole}`);
       if (!player.connected) tags.push("OFFLINE");
       if (state.phase === "gameover" && player.role) tags.push(player.role);
 
@@ -381,7 +457,7 @@ function renderStatusCard() {
       </div>
       <p class="muted">Alive players: ${state.aliveCount}</p>
       ${state.phase === "day" ? `<p>${state.votesCast} of ${state.aliveCount} votes in</p>${gameClock.markup("Voting ends in")}` : ""}
-      ${state.phase === "lobby" ? `<p>${state.practice ? "Practice room. The host can open the bot players’ views." : "Share the room code or invite link."} Night turns last ${Math.ceil(state.timing.night / 1000)} seconds.</p>` : ""}
+      ${state.phase === "lobby" ? `<p>${state.practice ? "Practice room. The host can tile the bot players’ views." : "Share the room code or invite link."} Everyone chooses during the same ${Math.ceil(state.timing.night / 1000)} seconds at night.</p>` : ""}
       ${state.phase === "gameover" ? renderGameOverSummary() : ""}
     </section>
   `;
@@ -389,27 +465,116 @@ function renderStatusCard() {
 
 function renderRoleCard() {
   const me = state.me;
-  const roleText = me.role || "No role yet";
   if (!me.role) return "";
-  if (!privateView) return `
+  if (!roleRevealed) return `
     <section class="card role-card">
       <h2>Role hidden</h2>
-      <button id="show-private-btn" class="secondary">Show role</button>
+      <button id="show-role-btn" class="secondary">Reveal role</button>
     </section>
   `;
 
   return `
     <section class="card role-card">
       <div class="card-title-row">
-        <h2>You are: ${escapeHtml(roleText)}</h2>
+        <h2>You are ${escapeHtml(me.role)}</h2>
         <span class="badge ${me.alive ? "alive-badge" : "dead-badge"}">${me.alive ? "Alive" : "Dead"}</span>
       </div>
       <p>${escapeHtml(state.roleDescriptions[me.role] || "")}</p>
-      ${state.phase !== "night" ? `<button id="hide-private-btn" class="secondary">Hide role</button>` : ""}
+      <button id="hide-private-btn" class="secondary">Hide role</button>
+      ${renderKnownPlayers(me)}
       ${renderMayorRevealButton()}
+      ${renderDayShot(me)}
+      ${renderSeerCard(me)}
+      ${renderOathCard(me)}
       ${renderPrivateMessages()}
     </section>
   `;
+}
+
+function renderKnownPlayers(me) {
+  if (!me.knownPlayers.length) return "";
+  return `<div class="private-box">
+    <h3>${me.role === "Vampire" ? "Evil teammates" : "Other Jesters"}</h3>
+    <ul class="private-roster">${me.knownPlayers.map(({ name, role }) =>
+      `<li>${escapeHtml(name)} <small>${escapeHtml(role)}</small></li>`).join("")}</ul>
+  </div>`;
+}
+
+function canUseRoleControls() {
+  return state.me.alive && !state.me.botAuto && (state.phase === "night" || state.phase === "day");
+}
+
+function renderDayShot(me) {
+  if (!canUseRoleControls() || state.phase !== "day" || me.role !== "Hunter" || me.abilityUsed) return "";
+  if (pendingDayChoice?.event === "hunterShot") return renderDayConfirmation("Fire your shot");
+  return `<div class="private-box">
+    <button id="toggle-hunter-picker" class="secondary">${choosingShot ? "Cancel shot" : "Choose a daytime shot"}</button>
+    ${choosingShot ? `<div class="target-grid">
+      ${choiceButtons(otherAlivePlayers().filter(({ id }) => id !== me.oath?.targetId), "day-shot")}
+    </div>` : ""}
+  </div>`;
+}
+
+function renderSeerCard(me) {
+  if (me.role !== "Seer") return "";
+  const highlighted = otherAlivePlayers().filter(({ id }) => me.seerTargets.includes(id));
+  const privateNames = highlighted.filter(({ publicRole }) => !publicRole).map(({ name }) => name);
+  const canGuess = canUseRoleControls() && !me.abilityUsed && !me.seerGuessPending && !me.oathActedTonight;
+  const target = highlighted.find(({ id }) => id === seerTargetId);
+  return `<div class="private-box seer-card">
+    <h3>People with roles</h3>
+    <p>Only you can see these highlights.</p>
+    ${privateNames.length ? `<p class="private-reminder">You cannot say these players have a role: ${escapeHtml(privateNames.join(", "))}.</p>` : ""}
+    <div class="target-grid">
+      ${highlighted.map(({ id, name }) => `<button type="button" class="seer-target${id === seerTargetId ? " selected" : ""}"
+        data-seer-target="${escapeHtml(id)}" ${canGuess ? "" : "disabled"}>${escapeHtml(name)}</button>`).join("")}
+    </div>
+    ${!highlighted.length ? '<p class="muted">No living players with roles remain.</p>' : ""}
+    ${me.seerGuessPending ? '<p class="muted">Your guess will resolve at dawn.</p>' : ""}
+    ${me.abilityUsed ? '<p class="muted">Your one guess has been used.</p>' : ""}
+    ${canGuess && target ? `
+      <form id="seer-guess-form" class="seer-guess-form">
+        <label>Choose a role for ${escapeHtml(target.name)}
+          <select id="seer-guess-role" required>
+            <option value="">Choose a role</option>
+            ${state.roleOrder.filter((role) => role !== "Villager").map((role) =>
+              `<option value="${escapeHtml(role)}" ${role === seerGuessRole ? "selected" : ""}>${escapeHtml(role)}</option>`).join("")}
+          </select>
+        </label>
+        <p>A wrong guess eliminates you.</p>
+        <button class="primary" type="submit" ${savingTurn ? "disabled" : ""}>Lock in guess</button>
+      </form>` : ""}
+  </div>`;
+}
+
+function renderOathCard(me) {
+  if (!me.oath) return "";
+  const { targetId, canReveal, revealed } = me.oath;
+  const choosing = canUseRoleControls() && choosingAccuser && !targetId && !me.seerGuessPending;
+  return `<div class="private-box">
+    <h3>Accuser’s Oath</h3>
+    <p>${targetId ? `Protect ${escapeHtml(playerName(targetId))}. You cannot vote against or target them with a hostile ability.`
+      : "Record the first player who accuses you of being a Vampire. You must protect them for the rest of the match."}</p>
+    ${choosing && pendingDayChoice?.event === "recordAccuser" ? renderDayConfirmation("Swear to protect") : ""}
+    ${choosing && state.phase === "night" && pendingNightChoice?.action.oath ? renderNightConfirmation() : ""}
+    ${choosing && !pendingDayChoice && !pendingNightChoice ? `<p>${state.phase === "night" ? "This replaces tonight’s move and shields your accuser tonight." : "They receive a shield on the next night."}</p>
+      <div class="target-grid">
+        ${choiceButtons(otherAlivePlayers(), "oath-target")}
+        <button type="button" id="skip-accuser" class="secondary">Skip</button>
+      </div>` : ""}
+    ${canUseRoleControls() && !targetId && !choosing && !me.seerGuessPending
+      ? '<button id="pick-accuser" class="secondary" type="button">Record first accuser</button>' : ""}
+    ${canReveal && canUseRoleControls() ? '<button id="reveal-oath-btn" class="secondary" type="button">Reveal oath to the table</button>' : ""}
+    ${revealed ? '<p class="muted">Revealed to the table.</p>' : ""}
+  </div>`;
+}
+
+function renderDayConfirmation(verb) {
+  return `<p>${escapeHtml(verb)}: ${escapeHtml(playerName(pendingDayChoice.targetId))}?</p>
+    <div class="night-options">
+      <button type="button" id="confirm-day-btn" class="primary">Confirm</button>
+      <button type="button" id="cancel-day-btn" class="secondary">Back</button>
+    </div>`;
 }
 
 function renderPrivateMessages() {
@@ -457,15 +622,16 @@ function renderBotControls() {
 function renderBotDesk() {
   if (!state.bots) return "";
   const inLobby = state.phase === "lobby";
+  const showingBoard = boardOpen && state.bots.length > 0;
   return `
     <details id="bot-desk" class="card bot-desk" ${botDeskOpen ? "open" : ""}>
       <summary>Practice bots <span class="badge">${state.bots.length}</span></summary>
-      ${inLobby ? `
-        <p>Open a bot window to play its turns. Bots with no open window play automatically.</p>
-        <div class="bot-actions">
+      <div class="bot-actions">
+        ${inLobby ? `
           <button type="button" id="add-bot-btn" class="primary">Add bot</button>
-          <button type="button" id="all-roles-btn" class="secondary">Set up all 8 roles</button>
-        </div>` : ""}
+          <button type="button" id="all-roles-btn" class="secondary">Set up all ${state.roleOrder.length} roles</button>` : ""}
+        ${state.bots.length ? `<button type="button" id="toggle-board" class="secondary">${showingBoard ? "Hide board" : "Tile bot views"}</button>` : ""}
+      </div>
       ${state.bots.length ? `<ul class="bot-list">
         ${state.bots.map((bot) => `
           <li>
@@ -473,7 +639,7 @@ function renderBotDesk() {
               <strong>${escapeHtml(bot.name)}${bot.role ? ` · ${escapeHtml(bot.role)}` : ""}</strong>
               <small>${bot.automatic ? "Automatic" : "Manual"}${bot.windowOpen ? " · Window open" : ""}</small>
             </div>
-            <a class="bot-open" href="${escapeHtml(botLink(bot))}" data-bot-id="${escapeHtml(bot.id)}" target="_blank" rel="noopener" aria-label="Open ${escapeHtml(bot.name)} window">Open window</a>
+            ${showingBoard ? "" : `<a class="bot-open" href="${escapeHtml(botLink(bot))}" data-bot-id="${escapeHtml(bot.id)}" target="_blank" rel="noopener" aria-label="Open ${escapeHtml(bot.name)} window">Open window</a>`}
             ${inLobby ? `<button type="button" class="bot-remove" data-remove-bot="${escapeHtml(bot.id)}" aria-label="Remove ${escapeHtml(bot.name)}">Remove</button>` : ""}
           </li>`).join("")}
       </ul>` : ""}
@@ -518,8 +684,38 @@ function renderRoleConfig() {
       <div class="role-grid">
         ${state.roleOrder.map((role) => renderRoleConfigRow(role)).join("")}
       </div>
+      ${renderRoomRules()}
     </div>
   `;
+}
+
+function renderRoomRules() {
+  const modes = {
+    off: "Off",
+    "random-town": "One random Town player",
+    "random-any": "One random player",
+    town: "All Town players",
+    "non-evil": "All Town and Neutral players",
+    evil: "All Evil players",
+    everyone: "Everyone",
+  };
+  return `<fieldset class="room-rule">
+    <legend>Custom rules</legend>
+    <label for="oath-mode">Accuser’s Oath</label>
+    <p class="muted">A player privately records their first accuser and must protect them.</p>
+    <select id="oath-mode">
+      ${Object.entries(modes).map(([mode, label]) =>
+        `<option value="${mode}" ${mode === state.oathMode ? "selected" : ""}>${label}</option>`).join("")}
+    </select>
+  </fieldset>
+  <fieldset class="room-rule">
+    <legend>End conditions</legend>
+    <label class="toggle-row">
+      <input type="checkbox" id="deadlock-draw" ${state.deadlockDraw ? "checked" : ""}>
+      Draw on a three-way deadlock
+    </label>
+    <p class="muted">A full one-vote-each tie among one Vampire, one Jester and one Villager ends in a draw.</p>
+  </fieldset>`;
 }
 
 function renderRoleConfigRow(role) {
@@ -532,9 +728,9 @@ function renderRoleConfigRow(role) {
     <div class="role-config-row">
       <label class="toggle-row">
         <input type="checkbox" class="role-enabled" data-role="${escapeHtml(role)}" ${config.enabled ? "checked" : ""}>
-        <span>${escapeHtml(role)}</span>
+        <span>${escapeHtml(role)} <small class="muted">${escapeHtml(state.roleAlignments[role])}</small></span>
       </label>
-      <select class="role-count" data-role="${escapeHtml(role)}">
+      <select class="role-count" data-role="${escapeHtml(role)}" aria-label="${escapeHtml(role)} count">
         ${options}
       </select>
     </div>
@@ -561,102 +757,18 @@ function renderActionCard() {
 }
 
 function renderNightActions() {
-  const role = state.me.role;
-
-  if (role === "Vampire") return renderVampireAction();
-  if (role === "Doctor") return renderDoctorAction();
-  if (role === "Detective") return renderDetectiveAction();
-  if (role === "Hunter" && !state.me.hunterUsed) return renderHunterAction();
-  if (role === "Transporter") return renderTransporterAction();
-  const canWatch = role === "Villager" && !state.me.villagerWatchUsed;
-
+  const needsPair = state.me.nightPickCount === 2;
+  const targets = alivePlayers().filter(({ id }) => state.me.nightTargetIds.includes(id));
   return `
     <section class="card action-card">
-      <h2>${canWatch ? "Keep watch" : "Cover turn"}</h2>
-      <p>${canWatch ? "Once per game, choose someone. If you survive, you’ll privately learn at dawn whether they used a targeted ability." : "Choose a player or pass to finish your private turn."}</p>
+      <h2>Choose ${needsPair ? "two names" : "a name"}</h2>
       <div class="target-grid">
-        ${targetButtons(otherAlivePlayers(), "night", "watch")}
-        <button class="secondary" data-night-skip="watch">${canWatch ? "Save watch for later" : "Pass"}</button>
+        ${choiceButtons(targets, "night-target", selectedTransporterTargets)}
       </div>
-    </section>
-  `;
-}
-
-function renderVampireAction() {
-  return `
-    <section class="card action-card">
-      <h2>Vampire action</h2>
-      <p>Choose one player to kill.</p>
-      <div class="target-grid">
-        ${targetButtons(otherAlivePlayers(), "night", "vampire")}
-        ${state.vampireCanSkip ? `<button class="secondary" data-night-skip="vampire">Skip killing tonight</button>` : ""}
-      </div>
-    </section>
-  `;
-}
-
-function renderDoctorAction() {
-  const lastSave = state.me.doctorLastSave;
-
-  return `
-    <section class="card action-card">
-      <h2>Doctor action</h2>
-      <p>Choose one player to save. You cannot save the same person two nights in a row.</p>
-      <div class="target-grid">
-        ${targetButtons(alivePlayers(), "night", "doctor", lastSave)}
-        <button class="secondary" data-night-skip="doctor">Skip save</button>
-      </div>
-    </section>
-  `;
-}
-
-function renderDetectiveAction() {
-  return `
-    <section class="card action-card">
-      <h2>Detective action</h2>
-      <p>Choose one player to investigate.</p>
-      <div class="target-grid">
-        ${targetButtons(otherAlivePlayers(), "night", "detective")}
-        <button class="secondary" data-night-skip="detective">Skip investigation</button>
-      </div>
-    </section>
-  `;
-}
-
-function renderHunterAction() {
-  return `
-    <section class="card action-card">
-      <h2>Hunter action</h2>
-      <p>You can shoot one player once per game. Choose carefully.</p>
-      <div class="target-grid">
-        ${targetButtons(otherAlivePlayers(), "night", "hunter")}
-        <button class="secondary" data-night-skip="hunter">Do not shoot tonight</button>
-      </div>
-    </section>
-  `;
-}
-
-function renderTransporterAction() {
-  return `
-    <section class="card action-card">
-      <h2>Transporter action</h2>
-      <p>Pick exactly two players to swap tonight.</p>
-      <div class="target-grid">
-        ${alivePlayers()
-          .map((player) => {
-            const selected = selectedTransporterTargets.includes(player.id);
-            return `
-              <button class="target-button ${selected ? "selected" : ""}" data-transporter-target="${escapeHtml(player.id)}">
-                ${escapeHtml(player.name)}
-              </button>
-            `;
-          })
-          .join("")}
-      </div>
-      <div class="button-grid small-gap">
-        <button id="send-transport-btn" class="primary" ${selectedTransporterTargets.length !== 2 ? "disabled" : ""}>Send Swap</button>
-        <button id="clear-transport-btn" class="secondary">Clear</button>
-        <button class="secondary" data-night-skip="transporter">Skip swap</button>
+      <div class="night-options">
+        ${needsPair ? `<button id="send-pair-btn" class="primary" ${selectedTransporterTargets.length === 2 ? "" : "disabled"}>Continue</button>` : ""}
+        ${state.me.role !== "Vampire" || state.vampireCanSkip || !targets.length
+          ? '<button type="button" id="skip-choice-btn" class="secondary">Skip</button>' : ""}
       </div>
     </section>
   `;
@@ -666,49 +778,26 @@ function renderDayVoting() {
   return `
     <section class="card action-card">
       <h2>Day vote</h2>
-      <p>Vote for one alive player. Mayor votes count as 2 only after revealing.</p>
+      <p>Vote for one alive player. A revealed Mayor counts as two votes.</p>
       ${state.me.dayVoteTarget ? `<p class="muted">Your current vote: ${escapeHtml(playerName(state.me.dayVoteTarget))}</p>` : ""}
       <div class="target-grid">
-        ${targetButtons(otherAlivePlayers(), "vote", "vote")}
+        ${choiceButtons(otherAlivePlayers().filter(({ id }) => id !== state.me.oath?.targetId), "vote-target", [state.me.dayVoteTarget])}
       </div>
     </section>
   `;
 }
 
-// ##################################### 9
-// Buttons and smaller render helpers
-function targetButtons(players, mode, actionName, disabledPlayerId = null) {
-  if (!players.length) return `<p class="muted">No valid targets.</p>`;
-
-  return players
-    .map((player) => {
-      const disabled = disabledPlayerId === player.id ? "disabled" : "";
-      const disabledText = disabled ? " Cannot choose twice" : "";
-
-      if (mode === "vote") {
-        return `
-          <button class="target-button" data-vote-target="${escapeHtml(player.id)}" ${disabled}>
-            ${escapeHtml(player.name)}${disabledText}
-          </button>
-        `;
-      }
-
-      return `
-        <button class="target-button" data-night-action="${escapeHtml(actionName)}" data-target-id="${escapeHtml(player.id)}" ${disabled}>
-          ${escapeHtml(player.name)}${disabledText}
-        </button>
-      `;
-    })
-    .join("");
+function choiceButtons(players, action, selected = []) {
+  if (!players.length) return '<p class="muted">No available players.</p>';
+  return players.map(({ id, name }) => `
+    <button type="button" class="target-button${selected.includes(id) ? " selected" : ""}"
+      data-${action}="${escapeHtml(id)}">${escapeHtml(name)}</button>
+  `).join("");
 }
 
 function renderMayorRevealButton() {
-  if (state.phase !== "day" || state.me.botAuto) return "";
-  if (state.me.role !== "Mayor" || !state.me.alive || state.me.mayorRevealed || !state.hasStarted || state.phase === "gameover") {
-    return "";
-  }
-
-  return `<button id="reveal-mayor-btn" class="primary full-width">Reveal as Mayor</button>`;
+  if (!canUseRoleControls() || state.me.role !== "Mayor" || state.me.mayorRevealed) return "";
+  return '<button id="reveal-mayor-btn" type="button" class="primary">Reveal as Mayor</button>';
 }
 
 function renderGameOverSummary() {
@@ -716,7 +805,7 @@ function renderGameOverSummary() {
 
   return `
     <div class="game-over-box">
-      <h3>Winner: ${escapeHtml(state.gameOver.winner)}</h3>
+      <h3>${state.gameOver.winner === "Draw" ? "Draw" : `Winner: ${escapeHtml(state.gameOver.winner)}`}</h3>
       <p>${escapeHtml(state.gameOver.reason)}</p>
     </div>
   `;
@@ -731,8 +820,8 @@ function renderFinalRolesCard() {
           ?.map((player) => `
             <div class="final-role-row">
               <span>${escapeHtml(player.name)}</span>
-              <strong>${escapeHtml(player.role)}</strong>
-              <em>${player.alive ? "Alive" : "Dead"}${player.connected ? "" : " / Offline"}</em>
+              <strong>${escapeHtml(player.role)}${player.rule ? ` · ${escapeHtml(player.rule)}` : ""}</strong>
+              <em>${player.won ? "Won · " : ""}${player.alive ? "Alive" : "Dead"}${player.connected ? "" : " / Offline"}</em>
             </div>
           `)
           .join("") || ""}
@@ -762,15 +851,42 @@ function renderRoleDescriptions() {
 // ##################################### 10
 // Dynamic event binding after render
 function bindDynamicButtons() {
-  $("add-bot-btn")?.addEventListener("click", () => socket.emit("addBot"));
-  $("all-roles-btn")?.addEventListener("click", () => socket.emit("setUpAllRoles"));
+  const roomActions = {
+    "add-bot-btn": "addBot",
+    "start-game-btn": "startGame",
+    "force-sleep-btn": "forceSleep",
+    "reset-game-btn": "resetGame",
+    "end-game-btn": "endGame",
+    "resolve-night-btn": "resolveNight",
+    "resolve-votes-btn": "resolveVotes",
+    "reveal-mayor-btn": "revealMayor",
+    "reveal-oath-btn": "revealOath",
+  };
+  for (const [id, event] of Object.entries(roomActions)) {
+    $(id)?.addEventListener("click", () => socket.emit(event));
+  }
+
+  $("all-roles-btn")?.addEventListener("click", () => {
+    boardOpen = true;
+    socket.emit("setUpAllRoles");
+  });
+  $("toggle-board")?.addEventListener("click", () => {
+    boardOpen = !boardOpen;
+    render();
+  });
   $("toggle-bot-auto")?.addEventListener("click", () => socket.emit("setBotAuto", !state.me.botAuto));
   document.querySelectorAll("[data-bot-id]").forEach((link) => link.addEventListener("click", openBotWindow));
   document.querySelectorAll("[data-remove-bot]").forEach((button) => {
     button.addEventListener("click", () => socket.emit("removeBot", button.dataset.removeBot));
   });
+
   $("show-private-btn")?.addEventListener("click", () => {
+    resetPrivateView();
     privateView = true;
+    render();
+  });
+  $("show-role-btn")?.addEventListener("click", () => {
+    roleRevealed = true;
     render();
   });
   $("hide-private-btn")?.addEventListener("click", hidePrivateView);
@@ -779,91 +895,104 @@ function bindDynamicButtons() {
     pendingNightChoice = null;
     render();
   });
-  $("skip-night-btn")?.addEventListener("click", () => socket.emit("skipNightTurn", state.nightTurn?.key));
-
-  const startButton = $("start-game-btn");
-  if (startButton) startButton.addEventListener("click", () => socket.emit("startGame"));
-
-  const forceSleepButton = $("force-sleep-btn");
-  if (forceSleepButton) forceSleepButton.addEventListener("click", () => socket.emit("forceSleep"));
-
-  const resetButton = $("reset-game-btn");
-  if (resetButton) resetButton.addEventListener("click", () => socket.emit("resetGame"));
-
-  const endButton = $("end-game-btn");
-  if (endButton) endButton.addEventListener("click", () => socket.emit("endGame"));
-
-  const resolveNightButton = $("resolve-night-btn");
-  if (resolveNightButton) resolveNightButton.addEventListener("click", () => socket.emit("resolveNight"));
-
-  const resolveVotesButton = $("resolve-votes-btn");
-  if (resolveVotesButton) resolveVotesButton.addEventListener("click", () => socket.emit("resolveVotes"));
-
-  const revealMayorButton = $("reveal-mayor-btn");
-  if (revealMayorButton) revealMayorButton.addEventListener("click", () => socket.emit("revealMayor"));
 
   document.querySelectorAll(".role-enabled, .role-count").forEach((input) => {
     input.addEventListener("change", () => {
       const role = input.dataset.role;
-      const enabledInput = document.querySelector(`.role-enabled[data-role="${role}"]`);
-      const countInput = document.querySelector(`.role-count[data-role="${role}"]`);
-
-      socket.emit("updateConfig", {
-        role,
-        enabled: enabledInput.checked,
-        count: Number(countInput.value),
-        vampireCanSkip: Boolean($("vampire-skip-toggle")?.checked),
-      });
+      const enabled = document.querySelector(`.role-enabled[data-role="${role}"]`).checked;
+      const count = Number(document.querySelector(`.role-count[data-role="${role}"]`).value);
+      socket.emit("updateConfig", { role, enabled, count });
     });
   });
+  $("vampire-skip-toggle")?.addEventListener("change", (event) =>
+    socket.emit("updateConfig", { vampireCanSkip: event.target.checked }));
+  $("oath-mode")?.addEventListener("change", (event) => socket.emit("updateConfig", { oathMode: event.target.value }));
+  $("deadlock-draw")?.addEventListener("change", (event) => socket.emit("updateConfig", { deadlockDraw: event.target.checked }));
 
-  const vampireSkipToggle = $("vampire-skip-toggle");
-  if (vampireSkipToggle) {
-    vampireSkipToggle.addEventListener("change", () => {
-      socket.emit("updateConfig", { vampireCanSkip: vampireSkipToggle.checked });
-    });
-  }
-
-  document.querySelectorAll("[data-night-action]").forEach((button) => {
+  document.querySelectorAll("[data-night-target]").forEach((button) => {
     button.addEventListener("click", () => {
-      const targetId = button.dataset.targetId;
-      chooseNightAction({ targetId }, playerName(targetId));
+      const { nightTarget: targetId } = button.dataset;
+      if (state.me.nightPickCount === 2) toggleTransporterTarget(targetId);
+      else chooseNightAction({ targetId }, playerName(targetId));
     });
   });
-
-  document.querySelectorAll("[data-night-skip]").forEach((button) => {
-    button.addEventListener("click", () => {
-      chooseNightAction({ skip: true }, button.textContent.trim());
-    });
+  $("skip-choice-btn")?.addEventListener("click", () => chooseNightAction({ skip: true }, "Skip"));
+  $("send-pair-btn")?.addEventListener("click", () => {
+    if (selectedTransporterTargets.length !== 2) return;
+    chooseNightAction({ targetIds: [...selectedTransporterTargets] }, selectedTransporterTargets.map(playerName).join(" and "));
   });
-
   document.querySelectorAll("[data-vote-target]").forEach((button) => {
+    button.addEventListener("click", () => socket.emit("vote", { targetId: button.dataset.voteTarget }));
+  });
+
+  bindRoleControls();
+}
+
+function bindRoleControls() {
+  $("pick-accuser")?.addEventListener("click", () => {
+    privateView = false;
+    pendingNightChoice = null;
+    pendingDayChoice = null;
+    choosingAccuser = true;
+    choosingShot = false;
+    seerTargetId = null;
+    seerGuessRole = "";
+    render();
+  });
+  $("skip-accuser")?.addEventListener("click", () => {
+    choosingAccuser = false;
+    render();
+  });
+  document.querySelectorAll("[data-oath-target]").forEach((button) => {
     button.addEventListener("click", () => {
-      socket.emit("vote", { targetId: button.dataset.voteTarget });
+      const { oathTarget: targetId } = button.dataset;
+      if (state.phase === "night") chooseNightAction({ targetId, oath: true }, `Protect ${playerName(targetId)}`);
+      else {
+        pendingDayChoice = { event: "recordAccuser", targetId };
+        render();
+      }
     });
   });
 
-  document.querySelectorAll("[data-transporter-target]").forEach((button) => {
-    button.addEventListener("click", () => {
-      toggleTransporterTarget(button.dataset.transporterTarget);
-    });
+  $("toggle-hunter-picker")?.addEventListener("click", () => {
+    pendingDayChoice = null;
+    choosingAccuser = false;
+    choosingShot = !choosingShot;
+    render();
   });
-
-  const sendTransportButton = $("send-transport-btn");
-  if (sendTransportButton) {
-    sendTransportButton.addEventListener("click", () => {
-      if (selectedTransporterTargets.length !== 2) return;
-      chooseNightAction({ targetIds: [...selectedTransporterTargets] }, selectedTransporterTargets.map(playerName).join(" and "));
-    });
-  }
-
-  const clearTransportButton = $("clear-transport-btn");
-  if (clearTransportButton) {
-    clearTransportButton.addEventListener("click", () => {
-      selectedTransporterTargets = [];
+  document.querySelectorAll("[data-day-shot]").forEach((button) => {
+    button.addEventListener("click", () => {
+      pendingDayChoice = { event: "hunterShot", targetId: button.dataset.dayShot };
       render();
     });
-  }
+  });
+  $("cancel-day-btn")?.addEventListener("click", () => {
+    pendingDayChoice = null;
+    render();
+  });
+  $("confirm-day-btn")?.addEventListener("click", () => {
+    const { event, targetId } = pendingDayChoice;
+    if (!socket.connected) return showToast("Reconnecting. Try again in a moment.");
+    socket.emit(event, targetId);
+    hidePrivateView();
+  });
+
+  document.querySelectorAll("[data-seer-target]").forEach((button) => {
+    button.addEventListener("click", () => {
+      privateView = false;
+      pendingNightChoice = null;
+      choosingAccuser = false;
+      pendingDayChoice = null;
+      seerTargetId = button.dataset.seerTarget;
+      seerGuessRole = "";
+      render();
+    });
+  });
+  $("seer-guess-role")?.addEventListener("change", (event) => { seerGuessRole = event.target.value; });
+  $("seer-guess-form")?.addEventListener("submit", (event) => {
+    event.preventDefault();
+    if (seerTargetId && seerGuessRole) sendLockedChoice("seerGuess", { targetId: seerTargetId, guess: seerGuessRole });
+  });
 }
 
 function chooseNightAction(action, label) {
@@ -872,23 +1001,23 @@ function chooseNightAction(action, label) {
 }
 
 function submitNightChoice() {
-  const turnKey = state?.nightTurn?.key;
-  if (!turnKey || !pendingNightChoice || savingTurn) return;
-  if (!socket.connected) return showToast("Reconnecting. Please try again in a moment.");
+  if (state?.nightKey && pendingNightChoice) sendLockedChoice("nightAction", pendingNightChoice.action);
+}
 
-  const { action } = pendingNightChoice;
+function sendLockedChoice(event, payload) {
+  if (savingTurn) return;
+  if (!socket.connected) return showToast("Reconnecting. Try again in a moment.");
+  const { nightKey, dayNumber, phase } = state;
   savingTurn = true;
   hidePrivateView();
-  socket.timeout(6500).emit("nightAction", { ...action, turnKey }, (error, message) => {
-    if (state?.nightTurn?.key !== turnKey || (!error && !message)) return;
+  socket.timeout(6500).emit(event, { ...payload, nightKey }, (error, message) => {
+    if (state?.nightKey !== nightKey || state?.phase !== phase || state?.dayNumber !== dayNumber) return;
     savingTurn = false;
     render();
-    showToast(message || "Could not confirm your choice. Check whose turn it is and try again.");
+    if (error || message) showToast(message || "Could not confirm your choice. Try again.");
   });
 }
 
-// ##################################### 11
-// Transporter local selection logic
 function toggleTransporterTarget(targetId) {
   if (selectedTransporterTargets.includes(targetId)) {
     selectedTransporterTargets = selectedTransporterTargets.filter((id) => id !== targetId);
@@ -903,11 +1032,10 @@ function toggleTransporterTarget(targetId) {
 // Socket listeners
 socket.on("state", (newState) => {
   const previous = state;
-  if (newState.phase !== previous?.phase || newState.nightTurn?.key !== previous?.nightTurn?.key
-    || newState.me.botAuto !== previous?.me.botAuto) {
-    privateView = false;
-    pendingNightChoice = null;
-    selectedTransporterTargets = [];
+  if (newState.phase !== previous?.phase || newState.nightKey !== previous?.nightKey
+    || newState.me.botAuto !== previous?.me.botAuto || newState.me.role !== previous?.me.role
+    || newState.me.alive !== previous?.me.alive) {
+    resetPrivateView();
     savingTurn = false;
   }
   state = newState;
@@ -927,10 +1055,16 @@ socket.on("state", (newState) => {
     showTransition("You were eliminated", "✦", "elimination");
   } else if (previous?.phase !== state.phase && state.phase === "day") {
     showTransition(`Day ${state.dayNumber}`, "☀");
-  } else if (previous?.phase !== state.phase && state.phase === "night") {
-    showTransition(state.nightTurn?.playerId === state.me.id ? "Your turn" : `Night ${state.nightNumber}`, "☾");
-  } else if (previous?.nightTurn?.key !== state.nightTurn?.key && state.nightTurn?.playerId === state.me.id) {
-    showTransition("Your turn", "☾");
+  } else if (state.phase === "night" && state.nightKey !== previous?.nightKey) {
+    showTransition(`Night ${state.nightNumber}`, "☾");
+  }
+  const latestNote = state.me.privateMessages.at(-1);
+  const priorNote = previous?.me.privateMessages.at(-1);
+  const newNight = state.nightKey && state.nightKey !== previous?.nightKey;
+  const oathReminder = newNight && state.me.oath && !state.me.oath.targetId;
+  const unreadNote = latestNote && (latestNote.text !== priorNote?.text || latestNote.time !== priorNote?.time);
+  if (state.me.alive && (oathReminder || unreadNote)) {
+    showToast("Private update. Reveal your role to read it.");
   }
 });
 

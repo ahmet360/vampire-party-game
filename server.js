@@ -24,7 +24,7 @@ const io = new Server(server, {
 });
 
 const timing = {
-  night: durationFromEnvironment("NIGHT_TURN_MS", 25000),
+  night: durationFromEnvironment("NIGHT_TURN_MS", 30000),
   day: durationFromEnvironment("DAY_VOTE_MS", 90000),
 };
 const roomAlphabet = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
@@ -33,20 +33,23 @@ const creationAttempts = new Map();
 const voiceCache = new WeakMap();
 const playerEvents = [
   "updateConfig", "startGame", "resetGame", "endGame", "forceSleep", "resolveNight",
-  "skipNightTurn", "nightAction", "revealMayor", "vote", "resolveVotes",
+  "nightAction", "revealMayor", "vote", "resolveVotes",
+  "recordAccuser", "revealOath", "seerGuess", "hunterShot",
   "addBot", "removeBot", "setUpAllRoles", "setBotAuto",
 ];
 
 app.disable("x-powered-by");
 app.use((request, response, next) => {
+  const frameAncestors = request.path === "/practice/player" ? "'self'" : "'none'";
   response.set({
-    "Content-Security-Policy": `default-src 'self'; connect-src 'self' ${websocketSource}; frame-ancestors 'none'; base-uri 'none'; form-action 'self'; object-src 'none'`,
+    "Content-Security-Policy": `default-src 'self'; connect-src 'self' ${websocketSource}; frame-ancestors ${frameAncestors}; base-uri 'none'; form-action 'self'; object-src 'none'`,
     "X-Content-Type-Options": "nosniff",
     "Referrer-Policy": "no-referrer",
   });
   next();
 });
 app.get("/healthz", (request, response) => response.type("text").send("ok"));
+app.get("/practice/player", (request, response) => response.sendFile(path.join(__dirname, "public", "index.html")));
 app.get("/table", (request, response) => response.sendFile(path.join(__dirname, "public", "table.html")));
 app.get("/table-audio/:room/:session/:id", async (request, response) => {
   const { room, session, id } = request.params;
@@ -124,7 +127,7 @@ io.on("connection", (socket) => {
   socket.on("joinBot", (payload) => {
     if (socket.data.gameCode) return;
     const room = rooms.get(roomCode(payload?.code));
-    if (!room?.joinBot(socket, payload?.token)) {
+    if (!room?.joinBot(socket, payload?.token, payload?.automatic)) {
       socket.emit("roomLeft", "This bot window has expired. Reopen its view from the practice room.");
     }
   });

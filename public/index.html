@@ -51,25 +51,38 @@
     </section>
   </main>
 
-  <div id="game-screen" class="screen hidden">
-    <header class="top-bar">
-      <div class="top-bar-title">
-        <strong class="game-wordmark">Vampire</strong>
-        <div class="room-tools">
-          <span id="room-label" class="badge room-tag"></span>
-          <button id="share-room-btn" type="button">Copy invite</button>
-          <button id="leave-room-btn" type="button">Leave</button>
-        </div>
+  <div class="practice-workspace">
+    <div class="player-screen">
+      <div id="game-screen" class="screen hidden">
+        <header class="top-bar">
+          <div class="top-bar-title">
+            <strong class="game-wordmark">Vampire</strong>
+            <div class="room-tools">
+              <span id="room-label" class="badge room-tag"></span>
+              <button id="share-room-btn" type="button">Copy invite</button>
+              <button id="leave-room-btn" type="button">Leave</button>
+            </div>
+          </div>
+          <div id="top-player-list" class="player-list"></div>
+        </header>
+        <main id="app"></main>
+        <section id="role-descriptions"></section>
       </div>
-      <div id="top-player-list" class="player-list"></div>
-    </header>
-    <main id="app"></main>
-    <section id="role-descriptions"></section>
+      <main id="night-panel" class="night-panel hidden"></main>
+      <div id="phase-transition" class="phase-transition hidden" role="status"></div>
+      <div id="toast" class="toast hidden" role="status"></div>
+    </div>
+    <aside id="practice-board" class="practice-board hidden" aria-labelledby="board-title">
+      <header class="board-toolbar">
+        <div>
+          <h2 id="board-title">Practice board</h2>
+          <p>Each tile is a live player view. Select Take control to make a bot’s choices.</p>
+        </div>
+        <button id="close-board" type="button" class="secondary">Hide board</button>
+      </header>
+      <div id="board-grid" class="board-grid"></div>
+    </aside>
   </div>
-
-  <main id="night-panel" class="night-panel hidden"></main>
-  <div id="phase-transition" class="phase-transition hidden" role="status"></div>
-  <div id="toast" class="toast hidden" role="status"></div>
 
   <script src="/socket.io/socket.io.js"></script>
   <script src="/clock.js"></script>

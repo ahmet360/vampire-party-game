@@ -588,6 +588,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .bot-desk summary .badge { margin-left: 7px; }
 .bot-desk p { margin: 12px 0; }
 .bot-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.bot-desk .bot-actions { margin-top: 12px; }
 .bot-list { list-style: none; margin: 14px 0 0; padding: 0; }
 .bot-list li {
   display: flex;
@@ -615,6 +616,103 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .bot-controls { display: flex; align-items: center; flex-wrap: wrap; justify-content: space-between; gap: 8px 12px; }
 .bot-controls h2 { margin-bottom: 2px; }
 .bot-controls p, #bot-entry-message { margin-bottom: 0; }
+
+.practice-board {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px;
+  background: #10101b;
+  border-left: 1px solid #574455;
+}
+
+.board-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px 12px;
+  padding: 4px;
+}
+.board-toolbar h2 { margin-bottom: 3px; color: #f6d9b6; }
+.board-toolbar p { margin: 0; color: var(--muted); font-size: .83rem; }
+.board-toolbar button { min-height: 35px; padding: 6px 10px; border-radius: 8px; }
+.board-grid {
+  display: grid;
+  flex: 1;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, max(232px, calc((100% - 36px) / 5))), 1fr));
+  grid-auto-rows: minmax(215px, 1fr);
+  gap: 9px;
+  min-height: 0;
+  overflow: auto;
+}
+.board-tile {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  overflow: hidden;
+  border: 1px solid #66536a;
+  border-radius: 9px;
+  background: #171523;
+}
+.board-tile h3 { margin: 0; padding: 5px 9px; background: #34283d; color: #f4d5ad; font-size: .78rem; }
+.board-tile iframe { flex: 1; width: 100%; min-height: 0; border: 0; color-scheme: dark; }
+
+@media (min-width: 900px) {
+  .has-practice-board .practice-workspace {
+    display: grid;
+    grid-template-columns: clamp(275px, 22vw, 355px) minmax(0, 1fr);
+    height: 100dvh;
+  }
+  .has-practice-board .player-screen { overflow: auto; transform: translateZ(0); }
+  .has-practice-board .player-screen::before {
+    content: "Your screen";
+    display: block;
+    padding: 9px 16px 0;
+    color: #f4d5ad;
+    font-weight: 700;
+    font-size: .82rem;
+  }
+}
+
+.board-player .screen, .board-player .night-panel { padding: 7px; }
+.board-player .card { margin-bottom: 7px; padding: 9px; border-radius: 10px; }
+.board-player .top-bar, .board-player #role-descriptions { display: none; }
+.board-player .phase-glyph { display: none; }
+.board-player .night-cover h1 { font-size: 1.34rem; }
+.board-player .round-label { margin-bottom: 5px; }
+.board-player .turn-clock { margin-top: 7px; }
+.board-player button { min-height: 34px; padding: 5px 7px; border-radius: 8px; }
+.board-player .target-grid { gap: 5px; }
+
+.night-options { display: flex; justify-content: center; flex-wrap: wrap; gap: 7px; margin-top: 11px; }
+.action-card .night-options, .private-box .night-options { justify-content: flex-start; }
+.private-box > button, .private-box .target-grid, .role-card > button + button { margin-top: 8px; }
+.private-roster { margin: 0; padding-left: 20px; }
+.private-roster small { color: var(--muted); }
+.private-reminder { color: #f2d2a6; }
+.seer-target {
+  color: #ffe9bd;
+  border-color: #af8959;
+  background: #4a3a47;
+}
+.seer-target:disabled { opacity: 1; cursor: default; }
+.seer-target.selected { outline: 2px solid #ffda94; outline-offset: -4px; }
+.seer-guess-form { display: grid; justify-items: start; gap: 8px; margin-top: 12px; }
+.seer-guess-form label { width: 100%; }
+.seer-guess-form select { margin-top: 5px; }
+.seer-guess-form p, .room-rule p { margin: 0; }
+.room-rule {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  margin: 12px 0 0;
+  padding: 10px 12px;
+  border: 1px solid #66536a;
+  border-radius: 10px;
+}
+.room-rule legend { padding: 0 4px; color: #f4d5ad; font-weight: 680; }
 
 .room-mode {
   display: grid;

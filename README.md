@@ -1,18 +1,23 @@
 # Vampire Party Game
 
-Vampire is a real-time social deduction game. Create a room, then share its six-character code or invite link. Players use their phones to take private turns and vote. An optional tablet view reads turn prompts and phase changes aloud.
+Vampire is a real-time social deduction game. Create a room, then share its six-character code or invite link. Players use their phones to make private choices and vote. An optional tablet announcer reads phase changes and public outcomes aloud.
 
-- Everyone who is still alive takes a night turn, including villagers. A player's screen covers their choice after they lock it in.
-- The table announcer calls players by name and saves role announcements until the whole night has finished.
-- The host configures roles, starts the round, and can skip a turn if someone disconnects.
-- A villager can watch one player per round and privately learn whether they used a targeted ability that night.
-- Night turns have a 25-second clock. During the day the table has 90 seconds to discuss and vote.
+- All living players share a 30-second night. Their screens cover their choices after they lock them in. Villagers, Mayors and Jesters pick a name as cover.
+- Use **Reveal role** for private role information and special controls. A Mayor can reveal any time during play. A Hunter can spend their one shot by day or night.
+- The host chooses which roles are dealt. Jesters know each other and earn individual wins when voted out. The town wins when every Vampire is gone. The Vampires and Silencers win if their living team reaches parity while a Vampire survives.
+- A Thief can steal a role once by targeting another player at night. The target’s night move fizzles, and the role changes at the start of the next night if both players survive. A Silencer can block one night move per match. At night, blocks resolve before thefts, and Transporter swaps affect saves, investigations, shots, and kill votes.
+- A Seer privately sees which players have roles and gets one exact guess. A correct guess publicly reveals the Seer and the target’s role. A wrong guess eliminates the Seer. Day guesses resolve immediately. Night guesses resolve at dawn.
+- Day discussion and voting last up to 90 seconds. The host can configure a draw if one Vampire, one Jester and one Villager each receive one vote.
+
+## Optional custom rule
+
+The **Accuser’s Oath** starts off. The host can assign it to a random player or a selected faction. Holders privately record the first person who accuses them of being a Vampire. Recording at night replaces their night move and shields the accuser that night. Recording by day shields the accuser the following night. Holders cannot vote against or directly harm that person for the rest of the match. An oath becomes public when its holder dies. A living holder can reveal it once the accuser dies or the room reaches one Vampire with four players, two with six, and so on.
 
 The room creator hosts automatically. To use the table announcer, open the room’s tablet link or enter the same code at `/table`.
 
 ## Practice with bots
 
-Check **Practice room** when creating a room. Use **Add bot** for individual seats or **Set up all 8 roles** to deal one of each role and fill the empty seats. **Open window** gives the host that bot’s player screen in a separate window. Bots play automatically when their windows are closed. An open bot window starts in manual control and has an **Auto-play** switch for observing.
+Check **Practice room** when creating a room. Use **Add bot** for individual seats or **Set up all 11 roles** to deal one of each role, fill the empty seats and open the tiled practice board. You can also open the board with **Tile bot views**. Bots on the board play automatically until you select **Take control**. With the board hidden, **Open window** opens a separate, positioned window for one bot in manual mode.
 
 ## Run locally
 

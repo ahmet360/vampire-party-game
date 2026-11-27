@@ -14,7 +14,6 @@ let lastCue = null;
 let seenCueId = 0;
 let tableSession = null;
 let roomCode = new URLSearchParams(location.search).get("room")?.toUpperCase() || "";
-let activeTurnKey = null;
 let audioEnabled = false;
 let screenLock = null;
 let playbackContext = null;
@@ -36,12 +35,12 @@ function playCue(cue) {
   const session = tableSession;
   const room = roomCode;
   audioQueue = audioQueue.then(async () => {
-    if (generation !== audioGeneration || session !== tableSession || (cue.turnKey && cue.turnKey !== activeTurnKey)) return;
+    if (generation !== audioGeneration || session !== tableSession) return;
     const response = await fetch(`/table-audio/${room}/${session}/${cue.id}`, { signal: AbortSignal.timeout(20000) });
     if (response.status === 404 && cue.id !== 0) return;
     if (!response.ok) throw new Error("The announcement could not load.");
     const buffer = await playbackContext.decodeAudioData(await response.arrayBuffer());
-    if (generation !== audioGeneration || session !== tableSession || (cue.turnKey && cue.turnKey !== activeTurnKey)) return;
+    if (generation !== audioGeneration || session !== tableSession) return;
 
     await new Promise((resolve) => {
       const source = playbackContext.createBufferSource();
@@ -170,20 +169,19 @@ tableSocket.on("tableState", (state) => {
   history.replaceState(null, "", url);
   document.getElementById("table-player-link").href = `/?room=${roomCode}`;
   audioButton.disabled = false;
-  const turn = state.nightTurn;
-  activeTurnKey = turn?.key || null;
   document.body.dataset.phase = state.phase;
-  if (state.phase === "night" && turn) {
+  if (state.phase === "night") {
     phaseLabel.textContent = `Room ${roomCode} · Night ${state.nightNumber}`;
-    turnLabel.textContent = `${turn.name}, it’s your turn.`;
-    progressLabel.textContent = `Turn ${turn.number} of ${turn.total}${turn.connected ? "" : " · Reconnecting"}`;
+    turnLabel.textContent = "Make a private choice";
+    progressLabel.textContent = "";
   } else if (state.phase === "day") {
     phaseLabel.textContent = `Room ${roomCode} · Day ${state.dayNumber}`;
     turnLabel.textContent = "Discuss and vote";
     progressLabel.textContent = `${state.votesCast} of ${state.aliveCount} votes in`;
   } else if (state.phase === "gameover") {
     phaseLabel.textContent = `Room ${roomCode} · Game over`;
-    turnLabel.textContent = state.winner === "No winner" ? "The host ended the game" : `Winner: ${state.winner}`;
+    const heading = { "No winner": "The host ended the game", Draw: "Draw" };
+    turnLabel.textContent = heading[state.winner] || `Winner: ${state.winner}`;
     progressLabel.textContent = "";
   } else {
     phaseLabel.textContent = `Room ${roomCode} · Lobby`;
@@ -201,7 +199,7 @@ tableSocket.on("tableState", (state) => {
   }
   seenCueId = lastCue?.id || 0;
   gameClock.set(state.clock, state.serverTime);
-  document.getElementById("table-clock").innerHTML = gameClock.markup(state.phase === "day" ? "Voting ends in" : "Turn ends in");
+  document.getElementById("table-clock").innerHTML = gameClock.markup(state.phase === "day" ? "Voting ends in" : "Night ends in");
   gameClock.refresh();
   cueList.replaceChildren(...state.cues.slice().reverse().map(({ text }) => {
     const item = document.createElement("li");
