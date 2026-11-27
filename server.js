@@ -33,7 +33,7 @@ const creationAttempts = new Map();
 const voiceCache = new WeakMap();
 const playerEvents = [
   "updateConfig", "startGame", "resetGame", "endGame", "forceSleep", "resolveNight",
-  "nightAction", "revealMayor", "vote", "resolveVotes",
+  "nightAction", "revealMayor", "startVoting", "vote", "resolveVotes",
   "openSecretBallot", "boostFogVote",
   "recordAccuser", "revealOath", "seerGuess", "hunterShot",
   "addBot", "removeBot", "setUpAllRoles", "setBotAuto",
@@ -128,7 +128,7 @@ io.on("connection", (socket) => {
   socket.on("joinBot", (payload) => {
     if (socket.data.gameCode) return;
     const room = rooms.get(roomCode(payload?.code));
-    if (!room?.joinBot(socket, payload?.token, payload?.automatic)) {
+    if (!room?.joinBot(socket, payload?.token)) {
       socket.emit("roomLeft", "This bot window has expired. Reopen its view from the practice room.");
     }
   });

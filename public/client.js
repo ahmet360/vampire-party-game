@@ -26,7 +26,6 @@ const botToken = new URLSearchParams(location.hash.slice(1)).get("bot");
 const inBoard = location.pathname === "/practice/player";
 const isBotWindow = inBoard || botToken !== null;
 let connectBot = isBotWindow;
-let firstBotJoin = true;
 const savedRoom = isBotWindow ? null : getSavedRoom();
 const playerId = isBotWindow ? null : getPlayerId();
 if (inBoard) document.body.classList.add("board-player");
@@ -95,7 +94,7 @@ function phaseLabel(phase) {
   const labels = {
     lobby: "Lobby",
     night: "Night / Sleep",
-    day: "Day Voting",
+    day: state.votingOpen ? "Day Voting" : "Day discussion",
     gameover: "Game Over",
   };
 
@@ -161,10 +160,7 @@ $("join-form").addEventListener("submit", (event) => {
 });
 
 socket.on("connect", () => {
-  if (connectBot) {
-    socket.emit("joinBot", { code: invitedRoom, token: botToken, automatic: firstBotJoin ? inBoard : undefined });
-    firstBotJoin = false;
-  }
+  if (connectBot) socket.emit("joinBot", { code: invitedRoom, token: botToken });
   else if (joinDetails?.code) socket.emit("join", joinDetails);
 });
 
@@ -466,7 +462,11 @@ function renderStatusCard() {
         <span class="badge">${escapeHtml(roundText || `${state.playerCount} player${state.playerCount === 1 ? "" : "s"}`)}</span>
       </div>
       <p class="muted">Alive players: ${state.aliveCount}</p>
-      ${state.phase === "day" ? `<p>${state.secretBallot ? "Secret ballot in progress" : `${state.votesCast} of ${state.aliveCount} votes in`}</p>${gameClock.markup("Voting ends in")}` : ""}
+      ${state.votingOpen ? `<p>${state.secretBallot ? "Secret ballot in progress" : `${state.votesCast} of ${state.aliveCount} votes in`}</p>${gameClock.markup("Voting ends in")}` : ""}
+      ${state.phase === "day" && !state.votingOpen ? `
+        <p>Discuss until you’re ready to vote.</p>
+        ${state.me.isHost ? '<button id="start-voting-btn" type="button" class="primary">Start voting</button>' : '<p class="muted">Waiting for the host to open voting.</p>'}
+      ` : ""}
       ${state.phase === "lobby" ? `<p>${state.practice ? "Practice room. The host can tile the bot players’ views." : "Share the room code or invite link."} Everyone chooses during the same ${Math.ceil(state.timing.night / 1000)} seconds at night.</p>` : ""}
       ${state.phase === "gameover" ? renderGameOverSummary() : ""}
     </section>
@@ -529,7 +529,7 @@ function renderDayShot(me) {
 function renderFogmasterCard(me) {
   if (!me.fogmaster || state.phase !== "day") return "";
   const { ballotsLeft, boostUsed, boostTargetId } = me.fogmaster;
-  const canAct = canUseRoleControls() && !savingTurn;
+  const canAct = canUseRoleControls() && state.votingOpen && !savingTurn;
   return `<div class="private-box">
     <h3>Fogmaster</h3>
     <p>${ballotsLeft} of 3 secret ballots left. ${boostUsed ? "Your +1 has been used." : "Your +1 is available."}</p>
@@ -686,7 +686,7 @@ function renderHostControls() {
       <div class="button-grid">
         <button id="start-game-btn" class="primary" ${state.phase !== "lobby" ? "disabled" : ""}>Start Game</button>
         <button id="force-sleep-btn" ${state.phase !== "day" ? "disabled" : ""}>Start Night Early</button>
-        <button id="resolve-votes-btn" ${state.phase !== "day" ? "disabled" : ""}>Resolve Votes</button>
+        <button id="resolve-votes-btn" ${!state.votingOpen ? "disabled" : ""}>Resolve Votes</button>
         <button id="end-game-btn" ${!state.hasStarted || state.phase === "gameover" ? "disabled" : ""}>End Game</button>
         <button id="reset-game-btn" class="danger">Reset Game</button>
       </div>
@@ -781,7 +781,7 @@ function renderActionCard() {
     `;
   }
 
-  if (state.phase === "day" && !state.me.botAuto) return renderDayVoting();
+  if (state.votingOpen && !state.me.botAuto) return renderDayVoting();
 
   return "";
 }
@@ -899,6 +899,10 @@ function bindDynamicButtons() {
   for (const [id, event] of Object.entries(roomActions)) {
     $(id)?.addEventListener("click", () => socket.emit(event));
   }
+  $("start-voting-btn")?.addEventListener("click", () => {
+    if (!socket.connected) return showToast("Reconnecting. Try again in a moment.");
+    socket.emit("startVoting", state.dayNumber);
+  });
 
   $("all-roles-btn")?.addEventListener("click", () => {
     boardOpen = true;

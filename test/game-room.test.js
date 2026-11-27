@@ -44,6 +44,11 @@ function id(player) {
   return player.state.me.id;
 }
 
+function startVoting(send, host) {
+  send(host, "startVoting", host.state.dayNumber);
+  assert.equal(host.state.votingOpen, true);
+}
+
 function pick(send, player, payload, expected = null) {
   let result;
   send(player, "nightAction", { nightKey: player.state.nightKey, ...payload }, (error) => { result = error; });
@@ -82,8 +87,8 @@ test("only the practice host receives bot access and a bot gets its own role", (
   assert.equal(room.joinBot(botWindow, bot.token), true);
   const hostId = host.state.me.id;
   const tiled = newSocket("tile");
-  assert.equal(room.joinBot(tiled, host.state.bots[1].token, true), true);
-  assert.equal(tiled.state.me.botAuto, true);
+  assert.equal(room.joinBot(tiled, host.state.bots[1].token), true);
+  assert.equal(tiled.state.me.botAuto, false);
   assert.equal(botWindow.state.me.botAuto, false);
   send(host, "startGame");
 
@@ -112,10 +117,10 @@ test("manual bots can sit out while attached and resume automatic choices on dis
 
   const vampire = host.state.bots.find(({ role }) => role === "Vampire");
   const vampireWindow = vampire ? newSocket("vampire") : host;
-  if (vampire) assert.equal(room.joinBot(vampireWindow, vampire.token, false), true);
+  if (vampire) assert.equal(room.joinBot(vampireWindow, vampire.token), true);
   const villager = host.state.bots.find(({ role }) => role === "Villager");
   const botWindow = newSocket("villager");
-  assert.equal(room.joinBot(botWindow, villager.token, false), true);
+  assert.equal(room.joinBot(botWindow, villager.token), true);
 
   pick(send, vampireWindow, { skip: true });
   const hostEvents = host.received;
@@ -127,8 +132,9 @@ test("manual bots can sit out while attached and resume automatic choices on dis
   t.mock.timers.tick(200);
 
   const reopened = newSocket("reopened");
-  assert.equal(room.joinBot(reopened, villager.token, true), true);
-  assert.equal(reopened.state.me.nightComplete, true);
+  assert.equal(room.joinBot(reopened, villager.token), true);
+  assert.equal(reopened.state.me.nightComplete, false);
+  assert.equal(reopened.state.me.botAuto, false);
   assert.deepEqual(reopened.state.me.privateMessages, []);
   assert.equal(host.state.phase, "night");
   t.mock.timers.tick(200);
@@ -136,6 +142,11 @@ test("manual bots can sit out while attached and resume automatic choices on dis
   assert.equal(host.state.aliveCount, 4);
 
   send(vampireWindow, "setBotAuto", true);
+  send(reopened, "setBotAuto", true);
+  t.mock.timers.tick(2000);
+  assert.equal(host.state.votesCast, 0);
+  assert.equal(host.state.clock, null);
+  startVoting(send, host);
   t.mock.timers.tick(600);
   assert.equal(host.state.votesCast, 3);
   send(host, "vote", { targetId: villager.id });
@@ -159,8 +170,10 @@ test("taking over during night replaces automatic choices without changing the s
   const [first, second] = host.state.bots;
   const firstTile = newSocket("first-tile");
   const secondTile = newSocket("second-tile");
-  assert.equal(room.joinBot(firstTile, first.token, true), true);
-  assert.equal(room.joinBot(secondTile, second.token, true), true);
+  assert.equal(room.joinBot(firstTile, first.token), true);
+  assert.equal(room.joinBot(secondTile, second.token), true);
+  send(firstTile, "setBotAuto", true);
+  send(secondTile, "setBotAuto", true);
   send(host, "startGame");
   const sharedClock = host.state.clock;
   t.mock.timers.tick(400);
@@ -170,7 +183,10 @@ test("taking over during night replaces automatic choices without changing the s
 
   send(firstTile, "setBotAuto", false);
   const secondWindow = newSocket("second-window");
-  assert.equal(room.joinBot(secondWindow, second.token, false), true);
+  assert.equal(room.joinBot(secondWindow, second.token), true);
+  assert.equal(secondWindow.state.me.botAuto, true);
+  assert.equal(secondWindow.state.me.nightComplete, true);
+  send(secondWindow, "setBotAuto", false);
   assert.equal(firstTile.state.me.nightComplete, false);
   assert.equal(secondWindow.state.me.nightComplete, false);
   assert.equal(firstTile.state.clock, sharedClock);
@@ -186,6 +202,92 @@ test("taking over during night replaces automatic choices without changing the s
   assert.equal(host.state.phase, "night");
   t.mock.timers.tick(400);
   assert.equal(host.state.phase, "day");
+});
+
+test("every open practice tile stays manual across automatic bot timing", (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1000 });
+  const { room, host, newSocket, send } = roomFixture(t);
+  send(host, "setUpAllRoles");
+  send(host, "updateConfig", { vampireCanSkip: true });
+  const tiles = host.state.bots.map(({ token }, index) => {
+    const tile = newSocket(`tile-${index}`);
+    assert.equal(room.joinBot(tile, token), true);
+    return tile;
+  });
+  send(host, "startGame");
+  pick(send, tiles[0], { skip: true });
+  t.mock.timers.tick(720);
+  assert.equal(tiles[0].state.me.nightComplete, true);
+  for (const actor of [host, ...tiles.slice(1)]) {
+    assert.equal(actor.state.me.botAuto, false);
+    assert.equal(actor.state.me.nightComplete, false);
+    assert.equal(actor.state.clock, host.state.clock);
+  }
+  pick(send, tiles[1], { skip: true });
+  pick(send, tiles[2], { skip: true });
+  assert.equal(tiles[3].state.me.nightComplete, false);
+  t.mock.timers.tick(80);
+  assert.equal(host.state.phase, "day");
+  assert.equal(host.state.clock, null);
+});
+
+test("discussion stays open for an hour and only the host can start voting once", (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1000 });
+  const { room, host, players, find, send } = gameFixture(t, ["Vampire", "Mayor", "Villager", "Villager", "Villager"]);
+  const mayor = find("Mayor");
+  const villager = find("Villager");
+  const vampire = find("Vampire");
+  send(host, "startVoting", 0);
+  assert.equal(host.state.phase, "night");
+  t.mock.timers.tick(800);
+  assert.equal(host.state.votingOpen, false);
+  assert.equal(room.buildTableState().clock, null);
+  send(players[1], "startVoting", 1);
+  send(host, "startVoting", 0);
+  send(host, "resolveVotes");
+  send(villager, "vote", { targetId: id(vampire) });
+  assert.equal(villager.state.me.dayVoteTarget, null);
+  t.mock.timers.tick(60 * 60 * 1000);
+  assert.equal(host.state.dayNumber, 1);
+  assert.equal(host.state.phase, "day");
+  assert.equal(host.state.clock, null);
+  assert.equal(room.buildTableState().votingOpen, false);
+  assert.equal(host.state.votesCast, 0);
+  send(mayor, "revealMayor");
+  assert.equal(mayor.state.me.mayorRevealed, true);
+
+  const startedAt = Date.now();
+  startVoting(send, host);
+  const clock = host.state.clock;
+  assert.equal(clock.deadline, startedAt + 1200);
+  assert.equal(room.buildTableState().clock, clock);
+  t.mock.timers.tick(100);
+  startVoting(send, host);
+  assert.equal(host.state.clock, clock);
+  assert.equal(room.buildTableState().cues.filter(({ text }) => text.startsWith("Voting is open")).length, 1);
+  send(villager, "vote", { targetId: id(vampire) });
+  t.mock.timers.tick(1100);
+  assert.equal(host.state.gameOver.winner, "Villagers");
+});
+
+test("a replacement host can open discussion voting, and voting can be skipped", (t) => {
+  const { room, host, players, send } = gameFixture(t, ["Vampire", "Villager", "Villager", "Villager"]);
+  send(host, "resolveNight");
+  const replacement = players[1];
+  room.leave(host, true);
+  assert.equal(replacement.state.me.isHost, true);
+  send(host, "startVoting", 1);
+  assert.equal(replacement.state.votingOpen, false);
+  send(replacement, "forceSleep");
+  assert.equal(replacement.state.phase, "night");
+  send(replacement, "resolveNight");
+  assert.equal(replacement.state.dayNumber, 2);
+  send(replacement, "startVoting", 1);
+  assert.equal(replacement.state.votingOpen, false);
+  startVoting(send, replacement);
+  send(replacement, "resolveVotes");
+  assert.equal(replacement.state.phase, "night");
+  assert.equal(replacement.state.votingOpen, false);
 });
 
 test("night choices share one deadline and stay private until they resolve", (t) => {
@@ -282,6 +384,7 @@ test("Jesters know each other but each earns their own win", (t) => {
   assert.deepEqual(vampire.state.me.knownPlayers, []);
   send(host, "resolveNight");
   const eliminateWithVotes = (target) => {
+    startVoting(send, host);
     for (const player of players.filter(({ state }) => state.me.alive)) {
       send(player, "vote", { targetId: id(player === target ? villager : target) });
     }
@@ -307,6 +410,7 @@ test("Vampire allies share the team victory and only successful Jesters win alon
   assert.equal(host.state.roleWinGoals.Fogmaster, "Wins with Vampires");
   assert.equal(host.state.roleWinGoals.Jester, "Personal goal");
   send(host, "resolveNight");
+  startVoting(send, host);
   for (const player of players) send(player, "vote", { targetId: id(player === winningJester ? villager : winningJester) });
   pick(send, vampire, { targetId: id(villager) });
   send(host, "resolveNight");
@@ -325,6 +429,7 @@ for (const deadlockDraw of [true, false]) {
     const jester = find("Jester");
     const villager = find("Villager");
     send(host, "resolveNight");
+    startVoting(send, host);
     send(vampire, "vote", { targetId: id(villager) });
     send(jester, "vote", { targetId: id(vampire) });
     send(villager, "vote", { targetId: id(jester) });
@@ -362,6 +467,7 @@ test("the Oath binds the accuser, shields them and unlocks public reveal after t
   pick(send, vampire, { targetId: id(accuser) });
   send(host, "resolveNight");
   assert.ok(accuser.state.me.alive);
+  startVoting(send, host);
   send(holder, "vote", { targetId: id(accuser) });
   assert.equal(holder.state.me.dayVoteTarget, null);
   if (holder !== hunter) {
@@ -450,6 +556,8 @@ test("the Fogmaster can open three secret ballots and use one private boost per 
   assert.match(useFog(send, fog, "openSecretBallot"), /unavailable/);
 
   send(host, "resolveNight");
+  assert.match(useFog(send, fog, "openSecretBallot"), /unavailable/);
+  startVoting(send, host);
   send(villager, "vote", { targetId: id(vampire) });
   assert.equal(room.buildTableState().votesCast, 1);
   assert.match(useFog(send, villager, "openSecretBallot"), /unavailable/);
@@ -476,6 +584,7 @@ test("the Fogmaster can open three secret ballots and use one private boost per 
   for (let day = 2; day <= 3; day += 1) {
     send(host, "forceSleep");
     send(host, "resolveNight");
+    startVoting(send, host);
     assert.equal(useFog(send, fog, "openSecretBallot"), null);
     assert.equal(fog.state.me.fogmaster.ballotsLeft, 3 - day);
     assert.equal(fog.state.me.fogmaster.boostTargetId, null);
@@ -484,6 +593,7 @@ test("the Fogmaster can open three secret ballots and use one private boost per 
   send(host, "forceSleep");
   send(host, "resolveNight");
   assert.equal(room.buildTableState().secretBallot, false);
+  startVoting(send, host);
   assert.match(useFog(send, fog, "openSecretBallot"), /all three/);
   send(host, "resetGame");
   send(host, "startGame");
@@ -498,6 +608,7 @@ test("a secret ballot stays open until the deadline and the Fogmaster’s bonus 
   const fog = find("Fogmaster");
   const [first, second, third, fourth] = players.filter(({ state }) => state.me.role === "Villager");
   send(host, "resolveNight");
+  startVoting(send, host);
   assert.equal(useFog(send, fog, "openSecretBallot"), null);
   for (const player of [vampire, fog, second]) send(player, "vote", { targetId: id(first) });
   for (const player of [first, third, fourth]) send(player, "vote", { targetId: id(vampire) });
@@ -518,6 +629,7 @@ test("a Thief inherits the Fogmaster’s remaining charges", (t) => {
   const fog = find("Fogmaster");
   const thief = find("Thief");
   send(host, "resolveNight");
+  startVoting(send, host);
   assert.equal(useFog(send, fog, "openSecretBallot"), null);
   assert.equal(useFog(send, fog, "boostFogVote", { targetId: id(thief) }), null);
   send(host, "forceSleep");

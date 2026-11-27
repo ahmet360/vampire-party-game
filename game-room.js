@@ -183,6 +183,7 @@ function createRoom(io, code, hostSession, timing, practice = false) {
       nightNumber: game.nightNumber,
       playerCount: getAllPlayers().length,
       aliveCount: getAlivePlayers().length,
+      votingOpen: isVotingOpen(),
       secretBallot: game.secretBallot,
       votesCast: game.secretBallot ? null : Object.keys(game.dayVotes).length,
       winner: game.gameOver?.winner || null,
@@ -248,6 +249,7 @@ function createRoom(io, code, hostSession, timing, practice = false) {
       oathMode: game.oathMode,
       deadlockDraw: game.deadlockDraw,
       nightKey: game.phase === "night" ? game.nightKey : null,
+      votingOpen: isVotingOpen(),
       secretBallot: game.secretBallot,
       votesCast: game.secretBallot ? null : Object.keys(game.dayVotes).length,
       messages: game.messages.slice(-30),
@@ -370,12 +372,12 @@ function createRoom(io, code, hostSession, timing, practice = false) {
     emitAll();
   }
 
-  function joinBot(socket, token, automatic) {
+  function joinBot(socket, token) {
     if (!practice || typeof token !== "string" || token.length !== 36 || emptySince !== null) return false;
     const bot = getAllPlayers().find((player) => player.botToken === token);
     if (!bot) return false;
     attachPlayerSocket(bot, socket);
-    if (typeof automatic === "boolean") setBotControl(bot, automatic);
+    setBotControl(bot, bot.botAuto);
     emitAll();
     return true;
   }
@@ -383,7 +385,7 @@ function createRoom(io, code, hostSession, timing, practice = false) {
   function addPracticeBot() {
     const bot = {
       id: randomUUID(), name: `Bot ${nextBotNumber++}`, botToken: randomUUID(), isBot: true,
-      connected: true, alive: true, isHost: false, role: null,
+      connected: true, alive: true, isHost: false, role: null, botAuto: false,
       mayorRevealed: false, privateMessages: [],
     };
     players.set(bot.id, bot);
@@ -482,7 +484,7 @@ function createRoom(io, code, hostSession, timing, practice = false) {
     const atNight = game.phase === "night";
     const needsChoice = (bot) => isAutomaticBot(bot)
       && (atNight ? !game.nightChoices.has(bot.id) : !game.dayVotes[bot.id]);
-    const botsDue = (atNight || game.phase === "day") && getAlivePlayers().some(needsChoice);
+    const botsDue = (atNight || isVotingOpen()) && getAlivePlayers().some(needsChoice);
     const clock = botsDue && emptySince === null ? game.clock : null;
     if (clock === botClock) return;
 
@@ -868,12 +870,16 @@ function nightMoves() {
     game.phase = "day";
     game.dayNumber += 1;
     game.dayVotes = {};
-    pushMessage(`Day ${game.dayNumber} begins. Discuss and vote.`);
-    announceToTable(`Day ${game.dayNumber}. Discuss and vote on your phones.`);
-    startClock(timing.day, resolveVotes);
+    const discussion = `Day ${game.dayNumber}. Discuss what happened. The host will open voting when you’re ready.`;
+    pushMessage(discussion);
+    announceToTable(discussion);
   }
 
   // Day voting resolution
+  function isVotingOpen() {
+    return game.phase === "day" && game.clock !== null;
+  }
+
   function allDayVotesSubmitted() {
     const aliveIds = getAlivePlayers().map((player) => player.id);
     if (aliveIds.length === 0) return false;
@@ -895,7 +901,7 @@ function nightMoves() {
   }
 
   function resolveVotes() {
-    if (game.phase !== "day") return;
+    if (!isVotingOpen()) return;
 
     const tally = {};
 
@@ -945,7 +951,7 @@ function nightMoves() {
   }
 
   function canAct(player) {
-    return Boolean(player?.alive && activeMatch() && Date.now() < game.clock?.deadline);
+    return Boolean(player?.alive && activeMatch() && (game.clock ? Date.now() < game.clock.deadline : game.phase === "day"));
   }
 
   function eliminate(player) {
@@ -1029,7 +1035,7 @@ function nightMoves() {
   }
 
   function submitVote(voter, targetId) {
-    if (!canAct(voter) || game.phase !== "day") return false;
+    if (!isVotingOpen() || !canAct(voter)) return false;
     if (!canVoteFor(voter, targetId)) return false;
 
     game.dayVotes[voter.id] = targetId;
@@ -1042,7 +1048,7 @@ function nightMoves() {
   }
 
   function canUseFogmaster(player, dayNumber) {
-    return canAct(player) && game.phase === "day" && dayNumber === game.dayNumber
+    return isVotingOpen() && canAct(player) && dayNumber === game.dayNumber
       && player.role === "Fogmaster" && !isAutomaticBot(player);
   }
 
@@ -1170,6 +1176,15 @@ function nightMoves() {
       emitAll();
     },
 
+    startVoting(socket, dayNumber) {
+      if (!isHostSocket(socket) || game.phase !== "day" || dayNumber !== game.dayNumber || isVotingOpen()) return;
+      const message = `Voting is open. You have ${Math.ceil(timing.day / 1000)} seconds to vote on your phones.`;
+      pushMessage(message);
+      announceToTable(message);
+      startClock(timing.day, resolveVotes);
+      emitAll();
+    },
+
     nightAction(socket, payload, acknowledge) {
       const player = getPlayer(socketToPlayerId.get(socket.id));
       const error = isAutomaticBot(player) ? "Take control before choosing an action." : submitNightAction(player, payload);
@@ -1219,7 +1234,7 @@ function nightMoves() {
         eliminate(victim);
         revealOath(victim);
       }
-      if (!checkWinConditions() && !game.secretBallot && allDayVotesSubmitted()) resolveVotes();
+      if (!checkWinConditions() && isVotingOpen() && !game.secretBallot && allDayVotesSubmitted()) resolveVotes();
       emitAll();
     },
 
