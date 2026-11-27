@@ -33,7 +33,7 @@ const creationAttempts = new Map();
 const voiceCache = new WeakMap();
 const playerEvents = [
   "updateConfig", "startGame", "resetGame", "endGame", "forceSleep", "resolveNight",
-  "nightAction", "revealMayor", "startVoting", "vote", "resolveVotes",
+  "nightAction", "voteNightExtension", "revealMayor", "startVoting", "vote", "resolveVotes",
   "openSecretBallot", "boostFogVote",
   "recordAccuser", "revealOath", "seerGuess", "hunterShot",
   "addBot", "removeBot", "setUpAllRoles", "setBotAuto",

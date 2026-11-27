@@ -3,7 +3,7 @@
 const socket = io();
 
 let state = null;
-let selectedTransporterTargets = [];
+let selectedNightTargets = [];
 let joinDetails = null;
 let privateView = false;
 let roleRevealed = false;
@@ -366,12 +366,15 @@ function renderNightScreen() {
       <p class="round-label">Night ${state.nightNumber}</p>
       <h1>${heading}</h1>
       ${gameClock.markup("Night ends in")}
+      ${state.nightNumber === 1 && !state.me.nightComplete && !roleRevealed && !choosing
+        ? '<p class="muted">Reveal your role to read it before you choose.</p>' : ""}
       <div class="night-options">
-        ${choosing ? `<button id="hide-private-btn" class="secondary">Cover screen</button>` : ""}
+        ${choosing && !roleRevealed ? `<button id="hide-private-btn" class="secondary">Cover screen</button>` : ""}
         ${state.me.alive && !state.me.nightComplete && !state.me.botAuto && !savingTurn && !choosing
           ? `<button id="show-private-btn" class="primary">Make choice</button>` : ""}
         ${state.me.role && !roleRevealed ? `<button id="show-role-btn" class="secondary">Reveal role</button>` : ""}
       </div>
+      ${renderNightExtension()}
     </section>
     ${roleRevealed ? renderRoleCard() : ""}
     ${choosing ? (pendingNightChoice ? renderNightConfirmation() : renderNightActions()) : ""}
@@ -387,6 +390,21 @@ function renderNightScreen() {
   `;
 }
 
+function renderNightExtension() {
+  const { alive, botAuto, nightExtension } = state.me;
+  if (!nightExtension) return "";
+  const { votes, required, voted, extended, seconds } = nightExtension;
+  if (extended) return `<p class="night-extension" role="status">The group added ${seconds}s.</p>`;
+  if (!alive || botAuto) return "";
+
+  return `<div class="night-extension">
+    <button type="button" id="vote-night-extension" class="secondary" ${voted ? "disabled" : ""}>
+      ${voted ? "Extension vote sent" : `Vote for ${seconds}s more`}
+    </button>
+    <span class="muted" role="status">${votes} of ${required} votes needed</span>
+  </div>`;
+}
+
 function resetPrivateView() {
   privateView = false;
   roleRevealed = false;
@@ -397,7 +415,7 @@ function resetPrivateView() {
   seerGuessRole = "";
   pendingDayChoice = null;
   pendingNightChoice = null;
-  selectedTransporterTargets = [];
+  selectedNightTargets = [];
 }
 
 function hidePrivateView() {
@@ -490,6 +508,9 @@ function renderRoleCard() {
         <span class="badge ${me.alive ? "alive-badge" : "dead-badge"}">${me.alive ? "Alive" : "Dead"}</span>
       </div>
       <p>${escapeHtml(state.roleDescriptions[me.role] || "")}</p>
+      ${me.nightPickCount > 1 && me.role === "Usurper" && state.phase === "night"
+        ? `<p>You can mark ${me.nightPickCount} other players.</p>` : ""}
+      ${me.usurperMarks?.length ? `<p>Your marks: ${escapeHtml(me.usurperMarks.map(playerName).join(", "))}</p>` : ""}
       <button id="hide-private-btn" class="secondary">Hide role</button>
       ${renderKnownPlayers(me)}
       ${renderMayorRevealButton()}
@@ -736,6 +757,8 @@ function renderRoomRules() {
       ${Object.entries(modes).map(([mode, label]) =>
         `<option value="${mode}" ${mode === state.oathMode ? "selected" : ""}>${label}</option>`).join("")}
     </select>
+    ${ruleCheckbox("revealOnDeath", "Reveal eliminated roles", "An eliminated player’s role appears in the public roster.")}
+    ${ruleCheckbox("doctorNoSelfSave", "No Doctor self-targeting", "The Doctor can only choose another player to protect.")}
   </fieldset>
   <fieldset class="room-rule">
     <legend>End conditions</legend>
@@ -744,7 +767,17 @@ function renderRoomRules() {
       Draw on a three-way deadlock
     </label>
     <p class="muted">A full one-vote-each tie among one Vampire, one Jester and one Villager ends in a draw.</p>
+    ${ruleCheckbox("strictVampireMajority", "Require a Vampire majority", "The Vampire team must outnumber the remaining players to win.")}
+    ${ruleCheckbox("quietNightDraw", "Draw after three quiet nights", "Three consecutive nights without a death end the match in a draw.")}
   </fieldset>`;
+}
+
+function ruleCheckbox(rule, label, detail) {
+  return `<label class="toggle-row">
+      <input type="checkbox" data-room-rule="${rule}" ${state.rules?.[rule] ? "checked" : ""}>
+      ${label}
+    </label>
+    <p class="muted">${detail}</p>`;
 }
 
 function renderRoleConfigRow(role) {
@@ -787,17 +820,26 @@ function renderActionCard() {
 }
 
 function renderNightActions() {
-  const needsPair = state.me.nightPickCount === 2;
+  const { nightAbility, nightPickCount, role } = state.me;
+  const multiple = nightPickCount > 1;
+  const marking = role === "Usurper" && multiple;
+  const abilityLabel = nightAbility === "Nurse" ? "Use your one save" : "Watch the Vampire attack";
+  const title = marking ? `Mark ${nightPickCount} players` : multiple ? "Choose two names" : "Choose a name";
   const targets = alivePlayers().filter(({ id }) => state.me.nightTargetIds.includes(id));
   return `
     <section class="card action-card">
-      <h2>Choose ${needsPair ? "two names" : "a name"}</h2>
+      ${nightAbility ? `<div class="private-box">
+        <h2>${nightAbility}</h2>
+        <button id="use-night-ability" class="primary">${abilityLabel}</button>
+      </div>` : ""}
+      <h2>${nightAbility ? "Or choose a name as cover" : title}</h2>
+      ${marking ? `<p>${selectedNightTargets.length} of ${nightPickCount} selected</p>` : ""}
       <div class="target-grid">
-        ${choiceButtons(targets, "night-target", selectedTransporterTargets)}
+        ${choiceButtons(targets, "night-target", selectedNightTargets)}
       </div>
       <div class="night-options">
-        ${needsPair ? `<button id="send-pair-btn" class="primary" ${selectedTransporterTargets.length === 2 ? "" : "disabled"}>Continue</button>` : ""}
-        ${state.me.role !== "Vampire" || state.vampireCanSkip || !targets.length
+        ${multiple ? `<button id="send-night-targets" class="primary" ${selectedNightTargets.length === nightPickCount ? "" : "disabled"}>Continue</button>` : ""}
+        ${role !== "Vampire" || state.vampireCanSkip || !targets.length
           ? '<button type="button" id="skip-choice-btn" class="secondary">Skip</button>' : ""}
       </div>
     </section>
@@ -903,6 +945,10 @@ function bindDynamicButtons() {
     if (!socket.connected) return showToast("Reconnecting. Try again in a moment.");
     socket.emit("startVoting", state.dayNumber);
   });
+  $("vote-night-extension")?.addEventListener("click", () => {
+    if (!socket.connected) return showToast("Reconnecting. Try again in a moment.");
+    socket.emit("voteNightExtension", state.nightKey);
+  });
 
   $("all-roles-btn")?.addEventListener("click", () => {
     boardOpen = true;
@@ -946,18 +992,22 @@ function bindDynamicButtons() {
     socket.emit("updateConfig", { vampireCanSkip: event.target.checked }));
   $("oath-mode")?.addEventListener("change", (event) => socket.emit("updateConfig", { oathMode: event.target.value }));
   $("deadlock-draw")?.addEventListener("change", (event) => socket.emit("updateConfig", { deadlockDraw: event.target.checked }));
+  document.querySelectorAll("[data-room-rule]").forEach((input) => {
+    input.addEventListener("change", () => socket.emit("updateConfig", { rules: { [input.dataset.roomRule]: input.checked } }));
+  });
 
   document.querySelectorAll("[data-night-target]").forEach((button) => {
     button.addEventListener("click", () => {
       const { nightTarget: targetId } = button.dataset;
-      if (state.me.nightPickCount === 2) toggleTransporterTarget(targetId);
+      if (state.me.nightPickCount > 1) toggleNightTarget(targetId);
       else chooseNightAction({ targetId }, playerName(targetId));
     });
   });
   $("skip-choice-btn")?.addEventListener("click", () => chooseNightAction({ skip: true }, "Skip"));
-  $("send-pair-btn")?.addEventListener("click", () => {
-    if (selectedTransporterTargets.length !== 2) return;
-    chooseNightAction({ targetIds: [...selectedTransporterTargets] }, selectedTransporterTargets.map(playerName).join(" and "));
+  $("use-night-ability")?.addEventListener("click", (event) => chooseNightAction({ ability: true }, event.currentTarget.textContent));
+  $("send-night-targets")?.addEventListener("click", () => {
+    if (selectedNightTargets.length !== state.me.nightPickCount) return;
+    chooseNightAction({ targetIds: [...selectedNightTargets] }, selectedNightTargets.map(playerName).join(", "));
   });
   document.querySelectorAll("[data-vote-target]").forEach((button) => {
     button.addEventListener("click", () => socket.emit("vote", { targetId: button.dataset.voteTarget }));
@@ -1071,11 +1121,11 @@ function sendLockedChoice(event, payload) {
   });
 }
 
-function toggleTransporterTarget(targetId) {
-  if (selectedTransporterTargets.includes(targetId)) {
-    selectedTransporterTargets = selectedTransporterTargets.filter((id) => id !== targetId);
-  } else if (selectedTransporterTargets.length < 2) {
-    selectedTransporterTargets.push(targetId);
+function toggleNightTarget(targetId) {
+  if (selectedNightTargets.includes(targetId)) {
+    selectedNightTargets = selectedNightTargets.filter((id) => id !== targetId);
+  } else if (selectedNightTargets.length < state.me.nightPickCount) {
+    selectedNightTargets.push(targetId);
   }
 
   render();

@@ -13,6 +13,9 @@ const ROLE_ORDER = [
   "Silencer",
   "Seer",
   "Fogmaster",
+  "Nurse",
+  "Lookout",
+  "Usurper",
 ];
 
 const ROLE_DESCRIPTIONS = {
@@ -28,6 +31,9 @@ const ROLE_DESCRIPTIONS = {
   Silencer: "Once per match, choose a player to block their night ability. You win with the Vampires. They can see that you are on their team.",
   Seer: "Your private role card highlights players with a role. Keep those names to yourself. You have one guess: name a player and their exact role. If you’re right, the game reveals you and their role. If you’re wrong, you die.",
   Fogmaster: "You win with the Vampires. Open up to three secret day ballots per match. On one secret ballot, you can privately add one extra vote to a player.",
+  Nurse: "Once per match, stop the entire Vampire attack for one night. You spend the save when it resolves, even if there was no attack. You never learn who was targeted.",
+  Lookout: "You win with the Vampires. On Nights 2, 4, 6 and so on, you can learn who the Vampires tried to kill. If a Doctor protects that player, the attack can shift once to another target.",
+  Usurper: "Mark several living players on one night. If the town later votes out one of your marks while you are alive and you voted for them too, you win individually. The match continues.",
 };
 
 const DEFAULT_ROLE_OUTCOME = { alignment: "Town", winner: "Villagers" };
@@ -35,13 +41,25 @@ const ROLE_OUTCOMES = {
   Vampire: { alignment: "Evil", winner: "Vampires" },
   Silencer: { alignment: "Evil", winner: "Vampires" },
   Fogmaster: { alignment: "Evil", winner: "Vampires" },
+  Lookout: { alignment: "Evil", winner: "Vampires" },
+  Usurper: { alignment: "Evil", personalWinEvent: "markedPlayerVotedOut" },
   Jester: { alignment: "Neutral", personalWinEvent: "votedOut" },
   Thief: { alignment: "Neutral", winner: "Villagers" },
 };
-const NIGHT_ROLES = new Set(["Vampire", "Doctor", "Detective", "Hunter", "Transporter", "Thief", "Silencer"]);
-const ONE_USE_ROLES = new Set(["Hunter", "Thief", "Silencer", "Seer"]);
+const NIGHT_ROLES = new Set(["Vampire", "Doctor", "Detective", "Hunter", "Transporter", "Thief", "Silencer", "Nurse", "Lookout", "Usurper"]);
+const ONE_USE_ROLES = new Set(["Hunter", "Thief", "Silencer", "Seer", "Nurse", "Usurper"]);
+const TARGETLESS_NIGHT_ROLES = new Set(["Nurse", "Lookout"]);
+const FIRST_NIGHT_BONUS_MS = 20000;
+const NIGHT_EXTENSION_MS = 15000;
+const QUIET_NIGHT_LIMIT = 3;
 const MAX_SECRET_BALLOTS = 3;
 const OATH_MODES = ["off", "random-town", "random-any", "town", "non-evil", "evil", "everyone"];
+const OPTIONAL_RULES = {
+  revealOnDeath: false,
+  doctorNoSelfSave: false,
+  strictVampireMajority: false,
+  quietNightDraw: false,
+};
 
 function roleOutcome(role) {
   return ROLE_OUTCOMES[role] ?? DEFAULT_ROLE_OUTCOME;
@@ -91,7 +109,12 @@ function createRoom(io, code, hostSession, timing, practice = false) {
     vampireCanSkip: false,
     oathMode: "off",
     deadlockDraw: true,
+    rules: { ...OPTIONAL_RULES },
+    startingPlayerCount: 0,
+    quietNights: 0,
     nightChoices: new Map(),
+    extensionVotes: new Set(),
+    nightExtended: false,
     nightKey: null,
     pendingThefts: [],
     clock: null,
@@ -248,6 +271,7 @@ function createRoom(io, code, hostSession, timing, practice = false) {
       vampireCanSkip: game.vampireCanSkip,
       oathMode: game.oathMode,
       deadlockDraw: game.deadlockDraw,
+      rules: game.rules,
       nightKey: game.phase === "night" ? game.nightKey : null,
       votingOpen: isVotingOpen(),
       secretBallot: game.secretBallot,
@@ -265,7 +289,7 @@ function createRoom(io, code, hostSession, timing, practice = false) {
         isHost: player.isHost,
         isBot: Boolean(player.isBot),
         mayorRevealed: player.mayorRevealed,
-        personalWin: player.personalWin || null,
+        personalWin: player.personalWin === "Usurper" && game.phase !== "gameover" ? null : player.personalWin || null,
         publicRole: player.publicRole || null,
         role: game.phase === "gameover" ? player.role : null,
       })),
@@ -302,7 +326,16 @@ function createRoom(io, code, hostSession, timing, practice = false) {
             } : null,
             privateMessages: me.privateMessages.slice(-10),
             nightComplete: game.nightChoices.has(me.id),
-            nightPickCount: nightRole(me) === "Transporter" ? 2 : 1,
+            nightPickCount: nightPickCount(nightRole(me)),
+            nightAbility: game.phase === "night" && TARGETLESS_NIGHT_ROLES.has(nightRole(me)) ? me.role : null,
+            nightExtension: game.phase === "night" ? {
+              required: Math.ceil(game.startingPlayerCount / 3),
+              votes: game.extensionVotes.size,
+              voted: game.extensionVotes.has(me.id),
+              extended: game.nightExtended,
+              seconds: NIGHT_EXTENSION_MS / 1000,
+            } : null,
+            usurperMarks: me.role === "Usurper" ? me.usurperMarks : undefined,
             nightTargetIds: game.phase === "night" && me.alive
               ? nightTargets(me, nightRole(me)).map(({ id }) => id) : [],
             dayVoteTarget: game.dayVotes[me.id] || null,
@@ -452,13 +485,21 @@ function createRoom(io, code, hostSession, timing, practice = false) {
   }
 
   function nightRole(player) {
+    if (player.role === "Lookout" && game.nightNumber % 2 !== 0) return null;
+    if (player.role === "Usurper" && getAlivePlayers().length <= nightPickCount(player.role)) return null;
     return NIGHT_ROLES.has(player.role) && !(ONE_USE_ROLES.has(player.role) && player.abilityUsed)
       ? player.role : null;
   }
 
+  function nightPickCount(role) {
+    if (role === "Usurper") return Math.floor((game.startingPlayerCount - 1) / 2);
+    return role === "Transporter" ? 2 : 1;
+  }
+
   function nightTargets(player, role) {
     return getAlivePlayers().filter((target) => {
-      if (role !== "Doctor" && role !== "Transporter" && target === player) return false;
+      const allowsSelf = role === "Transporter" || (role === "Doctor" && !game.rules.doctorNoSelfSave);
+      if (!allowsSelf && target === player) return false;
       if (role === "Doctor" && game.doctorLastSave[player.id] === target.id) return false;
       return !["Vampire", "Hunter", "Silencer", "Thief"].includes(role) || player.oath?.targetId !== target.id;
     });
@@ -467,10 +508,12 @@ function createRoom(io, code, hostSession, timing, practice = false) {
   function nextBotNightChoice(bot) {
     const role = nightRole(bot);
     const candidates = nightTargets(bot, role);
-    if (role === "Transporter") {
-      return candidates.length >= 2
-        ? { targetIds: shuffle(candidates).slice(0, 2).map((player) => player.id) } : { skip: true };
+    const pickCount = nightPickCount(role);
+    if (pickCount > 1) {
+      return candidates.length >= pickCount
+        ? { targetIds: shuffle(candidates).slice(0, pickCount).map((player) => player.id) } : { skip: true };
     }
+    if (role === "Lookout" || (role === "Nurse" && randomInt(3) === 0)) return { ability: true };
     if (role === "Hunter" && randomInt(3) !== 0) return { skip: true };
     return chooseTarget(candidates);
   }
@@ -504,8 +547,9 @@ function createRoom(io, code, hostSession, timing, practice = false) {
           emitPlayer(bot);
         } else {
           revealMayor(bot);
-          const candidates = getAlivePlayers().filter((player) => player !== bot && player.id !== bot.oath?.targetId);
-          submitVote(bot, chooseTarget(candidates).targetId);
+          const candidates = getAlivePlayers().filter((player) => canVoteFor(bot, player.id));
+          const marked = candidates.filter(({ id }) => bot.role === "Usurper" && bot.usurperMarks.includes(id));
+          submitVote(bot, chooseTarget(marked.length ? marked : candidates).targetId);
         }
       }
       if (atNight) scheduleBotActions();
@@ -518,13 +562,13 @@ function createRoom(io, code, hostSession, timing, practice = false) {
     game.clock = null;
   }
 
-  function startClock(duration, onExpire) {
+  function startClock(duration, onExpire, deadline = Date.now() + duration) {
     stopClock();
-    game.clock = { deadline: Date.now() + duration, duration };
+    game.clock = { deadline, duration };
     phaseTimer = setTimeout(() => {
       onExpire();
       emitAll();
-    }, duration);
+    }, Math.max(0, deadline - Date.now()));
   }
 
   // Lobby, role assignment, reset, and game over
@@ -556,6 +600,7 @@ function createRoom(io, code, hostSession, timing, practice = false) {
     Object.assign(player, {
       role: null, alive, mayorRevealed: false, abilityUsed: false, personalWin: null,
       oath: null, publicRole: null, privateMessages: [], fogBallotsUsed: 0, fogBoostUsed: false,
+      usurperMarks: [],
     });
   }
 
@@ -598,6 +643,10 @@ function createRoom(io, code, hostSession, timing, practice = false) {
       sendError(socket, "You selected more roles than connected players. Lower some role counts first.");
       return;
     }
+    if (activePlayers.length < 5 && rolePool.includes("Usurper")) {
+      sendError(socket, "The Usurper needs at least 5 players.");
+      return;
+    }
 
     while (rolePool.length < activePlayers.length) {
       rolePool.push("Villager");
@@ -609,6 +658,8 @@ function createRoom(io, code, hostSession, timing, practice = false) {
     game.hasStarted = true;
     game.dayNumber = 0;
     game.nightNumber = 0;
+    game.startingPlayerCount = activePlayers.length;
+    game.quietNights = 0;
     game.doctorLastSave = {};
     game.detectiveMemory = {};
     game.messages = [];
@@ -641,7 +692,11 @@ function createRoom(io, code, hostSession, timing, practice = false) {
     game.hasStarted = false;
     game.dayNumber = 0;
     game.nightNumber = 0;
+    game.startingPlayerCount = 0;
+    game.quietNights = 0;
     game.nightChoices.clear();
+    game.extensionVotes.clear();
+    game.nightExtended = false;
     game.nightKey = null;
     game.pendingThefts = [];
     game.dayVotes = {};
@@ -689,8 +744,10 @@ function createRoom(io, code, hostSession, timing, practice = false) {
     }
 
     const vampireTeamCount = alive.filter((player) => roleOutcome(player.role).winner === "Vampires").length;
-    if (vampireTeamCount >= alive.length - vampireTeamCount) {
-      setGameOver("Vampires", "The living Vampire team reached parity.");
+    const others = alive.length - vampireTeamCount;
+    if (vampireTeamCount > others || (vampireTeamCount === others && !game.rules.strictVampireMajority)) {
+      setGameOver("Vampires", game.rules.strictVampireMajority
+        ? "The living Vampire team outnumbers everyone else." : "The living Vampire team reached parity.");
       return true;
     }
 
@@ -712,6 +769,10 @@ function createRoom(io, code, hostSession, timing, practice = false) {
         thief.fogBallotsUsed = target.fogBallotsUsed;
         thief.fogBoostUsed = target.fogBoostUsed;
       }
+      if (thief.role === "Usurper") {
+        thief.usurperMarks = target.usurperMarks.filter((id) => id !== thief.id);
+        target.usurperMarks = [];
+      }
       target.role = "Villager";
       target.abilityUsed = false;
       target.mayorRevealed = false;
@@ -729,15 +790,20 @@ function createRoom(io, code, hostSession, timing, practice = false) {
     game.phase = "night";
     game.nightNumber += 1;
     game.nightChoices.clear();
+    game.extensionVotes.clear();
+    game.nightExtended = false;
     game.dayVotes = {};
     game.secretBallot = false;
     game.fogBoosts.clear();
     game.nightKey = randomUUID();
 
-    const message = `Night ${game.nightNumber}. Everyone has ${Math.ceil(timing.night / 1000)} seconds to make a private choice.`;
+    const duration = timing.night + (game.nightNumber === 1 ? FIRST_NIGHT_BONUS_MS : 0);
+    const message = game.nightNumber === 1
+      ? `Night 1. You have ${Math.ceil(duration / 1000)} seconds to read your role and make a private choice.`
+      : `Night ${game.nightNumber}. Everyone has ${Math.ceil(duration / 1000)} seconds to make a private choice.`;
     pushMessage(message);
     announceToTable(message);
-    startClock(timing.night, resolveNight);
+    startClock(duration, resolveNight);
   }
 
   function remapTarget(playerId, transporterPairs) {
@@ -763,11 +829,12 @@ function createRoom(io, code, hostSession, timing, practice = false) {
     return { targetId: topTargets[0][0], tied: false };
   }
 
-function nightMoves() {
+  function nightMoves() {
     return shuffle(getAlivePlayers()).flatMap((player) => {
       const choice = game.nightChoices.get(player.id);
       const role = choice?.guess ? "Seer" : nightRole(player);
       if (!role || !choice || choice.skip || choice.oath) return [];
+      if (TARGETLESS_NIGHT_ROLES.has(role) && !choice.ability) return [];
       return [{ player, role, ...choice }];
     });
   }
@@ -814,6 +881,35 @@ function nightMoves() {
     return target.role === "Vampire" ? [target.id] : [target.id, hunter.id];
   }
 
+  function resolveVampireAttack(active, vampireTally, doctorSaves) {
+    const original = getTopTargetFromTally(vampireTally).targetId;
+    const nurses = active.filter(({ role }) => role === "Nurse");
+    const lookouts = active.filter(({ role }) => role === "Lookout");
+    let targetId = original;
+
+    for (const { player } of nurses) {
+      player.abilityUsed = true;
+      pushPrivateMessage(player.id, "Your one-use save was spent. The Vampire attack could not kill anyone tonight.");
+    }
+
+    if (original && doctorSaves.has(original) && lookouts.length && !nurses.length) {
+      const attackers = active.filter(({ role }) => role === "Vampire");
+      targetId = chooseTarget(getAlivePlayers().filter(({ id, role }) => id !== original
+        && roleOutcome(role).winner !== "Vampires"
+        && attackers.every(({ player }) => player.oath?.targetId !== id))).targetId || null;
+    }
+
+    for (const { player } of lookouts) {
+      let report = original ? `The Vampires targeted ${getPlayerName(original)}.` : "The Vampires had no agreed target tonight.";
+      if (targetId && targetId !== original) {
+        report += ` The Doctor protected them, so the attack shifted to ${getPlayerName(targetId)}.`;
+      }
+      pushPrivateMessage(player.id, report);
+    }
+
+    return !nurses.length && targetId && !doctorSaves.has(targetId) ? targetId : null;
+  }
+
   function resolveNight() {
     if (game.phase !== "night") return;
     stopClock();
@@ -831,7 +927,13 @@ function nightMoves() {
     const vampireTally = {};
     game.doctorLastSave = {};
 
-    for (const { player, role, targetId, guess } of active) {
+    for (const { player, role, targetId, targetIds, guess } of active) {
+      if (role === "Usurper") {
+        player.abilityUsed = true;
+        player.usurperMarks = targetIds;
+        pushPrivateMessage(player.id, `Your marks are set: ${targetIds.map(getPlayerName).join(", ")}.`);
+        continue;
+      }
       if (!targetId) continue;
       if (role === "Seer") {
         if (!resolveSeerGuess(player, getPlayer(targetId), guess)) forcedDeaths.add(player.id);
@@ -852,8 +954,8 @@ function nightMoves() {
       }
     }
 
-    const vampirePick = getTopTargetFromTally(vampireTally).targetId;
-    if (vampirePick && !saves.has(vampirePick)) deaths.add(vampirePick);
+    const victim = resolveVampireAttack(active, vampireTally, saves);
+    if (victim) deaths.add(victim);
     for (const id of oathSaves) deaths.delete(id);
     for (const id of forcedDeaths) deaths.add(id);
     for (const id of deaths) eliminate(getPlayer(id));
@@ -865,7 +967,12 @@ function nightMoves() {
     for (const id of deaths) revealOath(getPlayer(id));
 
     game.nightChoices.clear();
+    game.quietNights = deaths.size ? 0 : game.quietNights + 1;
     if (checkWinConditions()) return;
+    if (game.rules.quietNightDraw && game.quietNights >= QUIET_NIGHT_LIMIT) {
+      setGameOver("Draw", "Three nights in a row passed without a death.");
+      return;
+    }
 
     game.phase = "day";
     game.dayNumber += 1;
@@ -932,6 +1039,12 @@ function nightMoves() {
       const eliminated = getPlayer(voteResult.targetId);
       if (eliminated?.alive) {
         const personalWin = awardPersonalWin(eliminated, "votedOut");
+        for (const player of getAlivePlayers()) {
+          if (player.role !== "Usurper" || game.dayVotes[player.id] !== eliminated.id || !player.usurperMarks.includes(eliminated.id)) continue;
+          if (awardPersonalWin(player, "markedPlayerVotedOut")) {
+            pushPrivateMessage(player.id, `You voted out ${eliminated.name}, one of your marks. You earned your Usurper win.`);
+          }
+        }
         eliminate(eliminated);
         const outcome = personalWin
           ? `${eliminated.name} was voted out and earned a ${personalWin} win.` : `${eliminated.name} was voted out.`;
@@ -956,6 +1069,7 @@ function nightMoves() {
 
   function eliminate(player) {
     player.alive = false;
+    if (game.rules.revealOnDeath) player.publicRole = player.role;
     delete game.dayVotes[player.id];
     for (const [voter, target] of Object.entries(game.dayVotes)) {
       if (target === player.id) delete game.dayVotes[voter];
@@ -1006,6 +1120,11 @@ function nightMoves() {
     const role = nightRole(player);
     const targets = nightTargets(player, role);
     const { targetId, targetIds } = payload;
+    if (payload.ability === true) {
+      if (!TARGETLESS_NIGHT_ROLES.has(role)) return "That night ability is unavailable.";
+      game.nightChoices.set(player.id, { ability: true, automatic });
+      return null;
+    }
     if (payload.skip === true) {
       if (role === "Vampire" && !game.vampireCanSkip && targets.length) return "Choose an available player.";
       game.nightChoices.set(player.id, { skip: true, automatic });
@@ -1013,9 +1132,11 @@ function nightMoves() {
     }
 
     const valid = (id) => targets.some((target) => target.id === id);
-    if (role === "Transporter") {
-      if (!Array.isArray(targetIds) || targetIds.length !== 2 || targetIds[0] === targetIds[1] || !targetIds.every(valid)) {
-        return "Choose two different living players.";
+    const pickCount = nightPickCount(role);
+    if (pickCount > 1) {
+      if (!Array.isArray(targetIds) || targetIds.length !== pickCount
+        || new Set(targetIds).size !== pickCount || !targetIds.every(valid)) {
+        return `Choose ${pickCount} different living players.`;
       }
       game.nightChoices.set(player.id, { targetIds, automatic });
     } else {
@@ -1126,7 +1247,7 @@ function nightMoves() {
     updateConfig(socket, payload) {
       if (!isHostSocket(socket)) return;
       if (game.phase !== "lobby") return;
-      const { role, enabled, count, vampireCanSkip, oathMode, deadlockDraw } = payload || {};
+      const { role, enabled, count, vampireCanSkip, oathMode, deadlockDraw, rules } = payload || {};
 
       if (ROLE_ORDER.includes(role)) {
         game.roleConfig[role] = {
@@ -1140,6 +1261,9 @@ function nightMoves() {
       }
       if (OATH_MODES.includes(oathMode)) game.oathMode = oathMode;
       if (typeof deadlockDraw === "boolean") game.deadlockDraw = deadlockDraw;
+      for (const key of Object.keys(OPTIONAL_RULES)) {
+        if (typeof rules?.[key] === "boolean") game.rules[key] = rules[key];
+      }
 
       emitAll();
     },
@@ -1190,6 +1314,23 @@ function nightMoves() {
       const error = isAutomaticBot(player) ? "Take control before choosing an action." : submitNightAction(player, payload);
       if (!error) emitPlayer(player);
       if (typeof acknowledge === "function") acknowledge(error);
+    },
+
+    voteNightExtension(socket, nightKey) {
+      const player = getPlayer(socketToPlayerId.get(socket.id));
+      if (game.phase !== "night" || nightKey !== game.nightKey || !canAct(player) || isAutomaticBot(player)
+        || game.nightExtended || game.extensionVotes.has(player.id)) return;
+
+      game.extensionVotes.add(player.id);
+      if (game.extensionVotes.size >= Math.ceil(game.startingPlayerCount / 3)) {
+        game.nightExtended = true;
+        const message = `The group added ${NIGHT_EXTENSION_MS / 1000} seconds to this night.`;
+        pushMessage(message);
+        announceToTable(message);
+        const { duration, deadline } = game.clock;
+        startClock(duration + NIGHT_EXTENSION_MS, resolveNight, deadline + NIGHT_EXTENSION_MS);
+      }
+      emitAll();
     },
 
     recordAccuser(socket, targetId) {
