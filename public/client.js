@@ -14,7 +14,10 @@ let seerTargetId = null;
 let seerGuessRole = "";
 let pendingDayChoice = null;
 let pendingNightChoice = null;
+let pendingMayorReveal = false;
 let savingTurn = false;
+let savingVote = false;
+let postingDiscussion = false;
 let roomMode = "create";
 let botDeskOpen = true;
 let boardOpen = false;
@@ -111,6 +114,54 @@ function showToast(message) {
     toast.classList.add("hidden");
   }, 3000);
 }
+
+function renderDiscussion() {
+  const open = state?.phase === "day";
+  $("discussion-panel").classList.toggle("hidden", !open);
+  if (!open) return;
+
+  $("discussion-provider").classList.toggle("hidden", !state.lunaDiscussion);
+  const messages = state.discussion || [];
+  const log = $("discussion-log");
+  const version = `${state.roomCode}:${messages.at(-1)?.id ?? "empty"}`;
+  $("discussion-empty").classList.toggle("hidden", messages.length > 0);
+  if (log.dataset.version !== version) {
+    const atBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 40;
+    log.dataset.version = version;
+    log.replaceChildren(...messages.map((message) => {
+      const row = document.createElement("div");
+      row.className = "discussion-message";
+      const author = document.createElement("strong");
+      author.textContent = message.automated ? `${message.name} · Bot` : message.name;
+      const text = document.createElement("p");
+      text.textContent = message.text;
+      row.append(author, text);
+      return row;
+    }));
+    if (atBottom) log.scrollTop = log.scrollHeight;
+  }
+  $("discussion-form").classList.toggle("hidden", !state.me.alive || state.me.botAuto);
+  $("discussion-submit").disabled = postingDiscussion;
+}
+
+$("discussion-form").addEventListener("submit", (event) => {
+  event.preventDefault();
+  if (postingDiscussion || state?.phase !== "day" || !state.me.alive || state.me.botAuto) return;
+  if (!socket.connected) return showToast("Reconnecting. Try again in a moment.");
+  const input = $("discussion-input");
+  const text = input.value.trim();
+  if (!text) return;
+  const { roomCode, dayNumber } = state;
+  postingDiscussion = true;
+  renderDiscussion();
+  socket.timeout(6500).emit("discuss", { dayNumber, text }, (error, message) => {
+    if (state?.roomCode !== roomCode || state.phase !== "day" || state.dayNumber !== dayNumber) return;
+    postingDiscussion = false;
+    if (error || message) showToast(message || "Could not send your message. Try again.");
+    else if (input.value.trim() === text) input.value = "";
+    renderDiscussion();
+  });
+});
 
 // ##################################### 3
 // Join screen handling
@@ -254,6 +305,9 @@ $("share-room-btn").addEventListener("click", copyInvite);
 $("leave-room-btn").addEventListener("click", () => socket.emit("leaveRoom"));
 
 function returnToRooms(message) {
+  $("discussion-input").value = "";
+  savingVote = false;
+  postingDiscussion = false;
   if (isBotWindow) {
     connectBot = false;
     state = null;
@@ -327,6 +381,7 @@ function render() {
   $("night-panel").classList.toggle("hidden", !atNight);
   $("game-screen").classList.toggle("hidden", atNight);
   if (atNight) {
+    $("app-status").replaceChildren();
     $("app").replaceChildren();
     renderNightScreen();
     bindDynamicButtons();
@@ -337,13 +392,13 @@ function render() {
   $("game-screen").classList.remove("hidden");
 
   $("top-player-list").innerHTML = renderPlayerList();
+  $("app-status").innerHTML = `${renderBotControls()}${renderStatusCard()}${state.votingOpen ? renderActionCard() : ""}`;
+  renderDiscussion();
   $("app").innerHTML = `
-    ${renderBotControls()}
-    ${renderStatusCard()}
     ${renderRoleCard()}
     ${renderBotDesk()}
     ${renderHostControls()}
-    ${renderActionCard()}
+    ${!state.votingOpen ? renderActionCard() : ""}
     ${renderMessagesCard()}
   `;
   $("role-descriptions").innerHTML = renderRoleDescriptions();
@@ -353,11 +408,16 @@ function render() {
 }
 
 function renderNightScreen() {
-  const choosing = privateView && state.me.alive && !state.me.botAuto && !state.me.nightComplete && !savingTurn;
+  const { nightCanChoose, nightComplete, alive, botAuto, role } = state.me;
+  const canChoose = nightCanChoose && !botAuto && !nightComplete && !savingTurn;
+  const choosing = privateView && canChoose;
+  const overtime = Boolean(state.clock?.overtimeUntil);
   let heading = "Make a private choice";
+  if (state.nightStage === "lookout") heading = canChoose ? "Make your final night choice" : "Waiting for the final choice";
+  else if (!nightCanChoose) heading = "Waiting for the other players";
   if (savingTurn) heading = "Saving your choice…";
-  if (state.me.nightComplete) heading = "Choice locked";
-  if (!state.me.alive) heading = "Watching the game";
+  if (nightComplete) heading = "Choice locked";
+  if (!alive) heading = "Watching the game";
 
   $("night-panel").innerHTML = `
     ${renderBotControls()}
@@ -365,14 +425,15 @@ function renderNightScreen() {
       <span class="phase-glyph" aria-hidden="true">☾</span>
       <p class="round-label">Night ${state.nightNumber}</p>
       <h1>${heading}</h1>
-      ${gameClock.markup("Night ends in")}
+      ${gameClock.markup(overtime ? "Overtime" : state.nightStage === "lookout" ? "Final choice ends in" : "Night ends in")}
+      ${overtime && canChoose ? '<p role="alert">Make your choice now. The game will act for you when overtime ends.</p>' : ""}
       ${state.nightNumber === 1 && !state.me.nightComplete && !roleRevealed && !choosing
-        ? '<p class="muted">Reveal your role to read it before you choose.</p>' : ""}
+        ? '<p class="muted">Read your private role before you choose.</p>' : ""}
       <div class="night-options">
         ${choosing && !roleRevealed ? `<button id="hide-private-btn" class="secondary">Cover screen</button>` : ""}
-        ${state.me.alive && !state.me.nightComplete && !state.me.botAuto && !savingTurn && !choosing
+        ${canChoose && !choosing
           ? `<button id="show-private-btn" class="primary">Make choice</button>` : ""}
-        ${state.me.role && !roleRevealed ? `<button id="show-role-btn" class="secondary">Reveal role</button>` : ""}
+        ${role && !roleRevealed ? `<button id="show-role-btn" class="secondary">View private role</button>` : ""}
       </div>
       ${renderNightExtension()}
     </section>
@@ -383,7 +444,7 @@ function renderNightScreen() {
       <details class="card night-host">
         <summary>Host controls</summary>
         <div class="button-grid">
-          <button id="resolve-night-btn" class="secondary">End night early</button>
+          ${state.nightStage !== "lookout" ? '<button id="resolve-night-btn" class="secondary">End night early</button>' : ""}
           <button id="end-game-btn" class="secondary">End game</button>
         </div>
       </details>` : ""}
@@ -415,6 +476,7 @@ function resetPrivateView() {
   seerGuessRole = "";
   pendingDayChoice = null;
   pendingNightChoice = null;
+  pendingMayorReveal = false;
   selectedNightTargets = [];
 }
 
@@ -480,11 +542,12 @@ function renderStatusCard() {
         <span class="badge">${escapeHtml(roundText || `${state.playerCount} player${state.playerCount === 1 ? "" : "s"}`)}</span>
       </div>
       <p class="muted">Alive players: ${state.aliveCount}</p>
-      ${state.votingOpen ? `<p>${state.secretBallot ? "Secret ballot in progress" : `${state.votesCast} of ${state.aliveCount} votes in`}</p>${gameClock.markup("Voting ends in")}` : ""}
+      ${state.votingOpen ? `<p>${state.secretBallot ? "Secret ballot in progress" : `${state.votesCast} of ${state.aliveCount} ballots in`}</p>${gameClock.markup("Voting ends in")}` : ""}
       ${state.phase === "day" && !state.votingOpen ? `
         <p>Discuss until you’re ready to vote.</p>
         ${state.me.isHost ? '<button id="start-voting-btn" type="button" class="primary">Start voting</button>' : '<p class="muted">Waiting for the host to open voting.</p>'}
       ` : ""}
+      ${state.me.isHost && state.votingOpen ? '<button id="resolve-votes-btn" type="button" class="secondary">Close voting and count ballots</button>' : ""}
       ${state.phase === "lobby" ? `<p>${state.practice ? "Practice room. The host can tile the bot players’ views." : "Share the room code or invite link."} Everyone chooses during the same ${Math.ceil(state.timing.night / 1000)} seconds at night.</p>` : ""}
       ${state.phase === "gameover" ? renderGameOverSummary() : ""}
     </section>
@@ -497,7 +560,7 @@ function renderRoleCard() {
   if (!roleRevealed) return `
     <section class="card role-card">
       <h2>Role hidden</h2>
-      <button id="show-role-btn" class="secondary">Reveal role</button>
+      <button id="show-role-btn" class="secondary">View private role</button>
     </section>
   `;
 
@@ -663,7 +726,7 @@ function renderBotControls() {
     <section class="card bot-controls" aria-label="Bot player controls">
       <div>
         <h2>${escapeHtml(state.me.name)}</h2>
-        <p class="muted">${state.me.botAuto ? "Playing automatically" : "You control this bot"} · Practice room</p>
+        <p class="muted">${state.me.botAuto ? "Discussing and playing automatically" : "You control this bot"} · Practice room</p>
       </div>
       <button type="button" id="toggle-bot-auto" class="secondary">${state.me.botAuto ? "Take control" : "Auto-play"}</button>
     </section>`;
@@ -707,7 +770,6 @@ function renderHostControls() {
       <div class="button-grid">
         <button id="start-game-btn" class="primary" ${state.phase !== "lobby" ? "disabled" : ""}>Start Game</button>
         <button id="force-sleep-btn" ${state.phase !== "day" ? "disabled" : ""}>Start Night Early</button>
-        <button id="resolve-votes-btn" ${!state.votingOpen ? "disabled" : ""}>Resolve Votes</button>
         <button id="end-game-btn" ${!state.hasStarted || state.phase === "gameover" ? "disabled" : ""}>End Game</button>
         <button id="reset-game-btn" class="danger">Reset Game</button>
       </div>
@@ -821,16 +883,23 @@ function renderActionCard() {
 
 function renderNightActions() {
   const { nightAbility, nightPickCount, role } = state.me;
+  if (nightAbility === "Lookout") return `<section class="card action-card">
+    <h2>Lookout</h2>
+    <div class="button-grid">
+      <button id="use-night-ability" class="primary">Watch the Vampire attack</button>
+      <button id="skip-choice-btn" class="secondary">Skip this watch</button>
+    </div>
+  </section>`;
   const multiple = nightPickCount > 1;
   const marking = role === "Usurper" && multiple;
-  const abilityLabel = nightAbility === "Nurse" ? "Use your one save" : "Watch the Vampire attack";
   const title = marking ? `Mark ${nightPickCount} players` : multiple ? "Choose two names" : "Choose a name";
   const targets = alivePlayers().filter(({ id }) => state.me.nightTargetIds.includes(id));
   return `
     <section class="card action-card">
+      ${!roleRevealed ? renderMayorRevealButton() : ""}
       ${nightAbility ? `<div class="private-box">
         <h2>${nightAbility}</h2>
-        <button id="use-night-ability" class="primary">${abilityLabel}</button>
+        <button id="use-night-ability" class="primary">Use your one save</button>
       </div>` : ""}
       <h2>${nightAbility ? "Or choose a name as cover" : title}</h2>
       ${marking ? `<p>${selectedNightTargets.length} of ${nightPickCount} selected</p>` : ""}
@@ -850,11 +919,14 @@ function renderDayVoting() {
   return `
     <section class="card action-card">
       <h2>${state.secretBallot ? "Secret ballot" : "Day vote"}</h2>
-      <p>${state.secretBallot ? "Your choice is private. The result is announced when the ballot closes." : "Vote for one alive player. A revealed Mayor counts as two votes."}</p>
-      ${state.me.dayVoteTarget ? `<p class="muted">Your current vote: ${escapeHtml(playerName(state.me.dayVoteTarget))}</p>` : ""}
+      <p>${state.secretBallot ? "Your choice is private. You can change it until the ballot closes." : "Tap a name to vote. You can change your vote while the ballot is open."}</p>
+      <p class="ballot-status" role="status">${state.me.dayVoteTarget
+        ? `Vote recorded for ${escapeHtml(playerName(state.me.dayVoteTarget))}.`
+        : state.me.dayVoteAbstained ? "Abstention recorded." : "You haven’t voted yet."}</p>
       <div class="target-grid">
         ${choiceButtons(dayVoteTargets(), "vote-target", [state.me.dayVoteTarget])}
       </div>
+      <button type="button" id="abstain-btn" class="secondary" ${savingVote ? "disabled" : ""}>Abstain</button>
     </section>
   `;
 }
@@ -867,13 +939,21 @@ function choiceButtons(players, action, selected = []) {
   if (!players.length) return '<p class="muted">No available players.</p>';
   return players.map(({ id, name }) => `
     <button type="button" class="target-button${selected.includes(id) ? " selected" : ""}"
-      data-${action}="${escapeHtml(id)}">${escapeHtml(name)}</button>
+      data-${action}="${escapeHtml(id)}" ${action === "vote-target" && savingVote ? "disabled" : ""}>${escapeHtml(name)}</button>
   `).join("");
 }
 
 function renderMayorRevealButton() {
-  if (!canUseRoleControls() || state.me.role !== "Mayor" || state.me.mayorRevealed) return "";
-  return '<button id="reveal-mayor-btn" type="button" class="primary">Reveal as Mayor</button>';
+  if (!canUseRoleControls() || state.me.role !== "Mayor") return "";
+  if (state.me.mayorRevealed) return '<p role="status">You publicly revealed as Mayor. Your vote counts as two.</p>';
+  return `<div class="private-box">
+    <p>Your Mayor role is hidden. Your vote counts as one.</p>
+    ${pendingMayorReveal ? `<p>Everyone will see that you’re the Mayor. Your vote will count as two.</p>
+      <div class="button-grid">
+        <button id="confirm-mayor-btn" type="button" class="primary">Confirm public reveal</button>
+        <button id="keep-mayor-hidden-btn" type="button" class="secondary">Stay hidden</button>
+      </div>` : '<button id="reveal-mayor-btn" type="button" class="secondary">Reveal as Mayor</button>'}
+  </div>`;
 }
 
 function renderGameOverSummary() {
@@ -935,7 +1015,6 @@ function bindDynamicButtons() {
     "end-game-btn": "endGame",
     "resolve-night-btn": "resolveNight",
     "resolve-votes-btn": "resolveVotes",
-    "reveal-mayor-btn": "revealMayor",
     "reveal-oath-btn": "revealOath",
   };
   for (const [id, event] of Object.entries(roomActions)) {
@@ -979,6 +1058,22 @@ function bindDynamicButtons() {
     pendingNightChoice = null;
     render();
   });
+  $("reveal-mayor-btn")?.addEventListener("click", () => {
+    pendingMayorReveal = true;
+    render();
+  });
+  $("keep-mayor-hidden-btn")?.addEventListener("click", () => {
+    pendingMayorReveal = false;
+    render();
+  });
+  $("confirm-mayor-btn")?.addEventListener("click", () => {
+    if (!socket.connected) return showToast("Reconnecting. Try again in a moment.");
+    pendingMayorReveal = false;
+    render();
+    socket.timeout(6500).emit("revealMayor", (error, message) => {
+      if (error || message) showToast(message || "Could not confirm your reveal. Check your role card.");
+    });
+  });
 
   document.querySelectorAll(".role-enabled, .role-count").forEach((input) => {
     input.addEventListener("change", () => {
@@ -1010,10 +1105,25 @@ function bindDynamicButtons() {
     chooseNightAction({ targetIds: [...selectedNightTargets] }, selectedNightTargets.map(playerName).join(", "));
   });
   document.querySelectorAll("[data-vote-target]").forEach((button) => {
-    button.addEventListener("click", () => socket.emit("vote", { targetId: button.dataset.voteTarget }));
+    button.addEventListener("click", () => submitDayVote({ targetId: button.dataset.voteTarget }));
   });
+  $("abstain-btn")?.addEventListener("click", () => submitDayVote({ abstain: true }));
 
   bindRoleControls();
+}
+
+function submitDayVote(choice) {
+  if (savingVote || !state?.ballotKey) return;
+  if (!socket.connected) return showToast("Reconnecting. Try again in a moment.");
+  const { ballotKey } = state;
+  savingVote = true;
+  render();
+  socket.timeout(6500).emit("vote", { ...choice, ballotKey }, (error, message) => {
+    if (state?.ballotKey !== ballotKey) return;
+    savingVote = false;
+    render();
+    if (error || message) showToast(message || "Could not confirm your ballot. Try again while voting is open.");
+  });
 }
 
 function bindRoleControls() {
@@ -1135,6 +1245,11 @@ function toggleNightTarget(targetId) {
 // Socket listeners
 socket.on("state", (newState) => {
   const previous = state;
+  if (newState.ballotKey !== previous?.ballotKey) savingVote = false;
+  if (newState.phase !== previous?.phase || newState.dayNumber !== previous?.dayNumber) {
+    postingDiscussion = false;
+    $("discussion-input").value = "";
+  }
   if (newState.phase !== previous?.phase || newState.nightKey !== previous?.nightKey
     || newState.me.botAuto !== previous?.me.botAuto || newState.me.role !== previous?.me.role
     || newState.me.alive !== previous?.me.alive) {
@@ -1170,9 +1285,21 @@ socket.on("state", (newState) => {
   const newNight = state.nightKey && state.nightKey !== previous?.nightKey;
   const oathReminder = newNight && state.me.oath && !state.me.oath.targetId;
   const unreadNote = latestNote && (latestNote.text !== priorNote?.text || latestNote.time !== priorNote?.time);
-  if (state.me.alive && (oathReminder || unreadNote)) {
-    showToast("Private update. Reveal your role to read it.");
+  if (state.phase === "night" && state.me.nightCanChoose && !state.me.nightComplete && !state.me.botAuto
+    && state.clock?.overtimeUntil && state.clock.overtimeUntil !== previous?.clock?.overtimeUntil) {
+    showToast("Your night choice is overdue. Choose now or the game will act for you.");
+  } else if (state.phase === "night" && state.nightStage === "lookout" && previous?.nightStage !== "lookout"
+    && state.me.nightCanChoose && !state.me.botAuto) {
+    showToast("Your Lookout turn is ready. Make the final choice.");
+  } else if (state.me.alive && (oathReminder || unreadNote)) {
+    showToast("Private update. Open your role card to read it.");
   }
+});
+
+socket.on("discussionUpdate", ({ roomCode, dayNumber, messages }) => {
+  if (state?.roomCode !== roomCode || state.phase !== "day" || state.dayNumber !== dayNumber) return;
+  state.discussion = messages;
+  renderDiscussion();
 });
 
 socket.on("roomLeft", returnToRooms);

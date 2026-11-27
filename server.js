@@ -5,6 +5,7 @@ const { isIP } = require("node:net");
 const path = require("node:path");
 const { Server } = require("socket.io");
 const { createRoom } = require("./game-room");
+const { createLunaSpeaker } = require("./luna-discussion");
 const { renderAnnouncement } = require("./announce-audio");
 
 const app = express();
@@ -31,9 +32,10 @@ const roomAlphabet = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
 const rooms = new Map();
 const creationAttempts = new Map();
 const voiceCache = new WeakMap();
+const speakWithLuna = createLunaSpeaker(process.env.OPENAI_API_KEY);
 const playerEvents = [
   "updateConfig", "startGame", "resetGame", "endGame", "forceSleep", "resolveNight",
-  "nightAction", "voteNightExtension", "revealMayor", "startVoting", "vote", "resolveVotes",
+  "nightAction", "voteNightExtension", "revealMayor", "startVoting", "vote", "resolveVotes", "discuss",
   "openSecretBallot", "boostFogVote",
   "recordAccuser", "revealOath", "seerGuess", "hunterShot",
   "addBot", "removeBot", "setUpAllRoles", "setBotAuto",
@@ -112,7 +114,7 @@ io.on("connection", (socket) => {
       return socket.emit("errorMessage", "Room creation is busy. Give it a moment and try again.");
     }
     const code = newRoomCode();
-    const room = createRoom(io, code, payload.sessionId, timing, payload.practice === true);
+    const room = createRoom(io, code, payload.sessionId, timing, payload.practice === true, speakWithLuna);
     rooms.set(code, room);
     room.join(socket, payload.sessionId, payload.name);
   });

@@ -1,4 +1,5 @@
 const { randomInt, randomUUID } = require("node:crypto");
+const { formOpinion, mentionsPlayer, writeDiscussionLine } = require("./bot-discussion");
 
 const ROLE_ORDER = [
   "Vampire",
@@ -25,14 +26,14 @@ const ROLE_DESCRIPTIONS = {
   Detective: "Investigate one player each night. The first check of an evil player is suspicious. A repeat check shows their exact role.",
   Villager: "Pick a name as cover at night. Your choice has no effect. Discuss and vote during the day.",
   Hunter: "You have one shot for the match, by day or by night. If the target is a Vampire, only they die. Otherwise you die too.",
-  Mayor: "Reveal during the day or night from your private role card. Once revealed, your vote counts as 2. Your night choice is cover.",
+  Mayor: "Your vote counts as one while hidden. Use and confirm Reveal as Mayor to make your role public and count as two. Your night choice is cover.",
   Transporter: "Pick two players at night. Saves, investigations, shots, and kill votes aimed at either player go to the other.",
   Thief: "Once per match, choose someone at night to steal their role without seeing it first. Their night ability fizzles. If you both survive, you swap into their role next night and they become a Villager. Until then, you win with the Villagers.",
   Silencer: "Once per match, choose a player to block their night ability. You win with the Vampires. They can see that you are on their team.",
   Seer: "Your private role card highlights players with a role. Keep those names to yourself. You have one guess: name a player and their exact role. If you’re right, the game reveals you and their role. If you’re wrong, you die.",
   Fogmaster: "You win with the Vampires. Open up to three secret day ballots per match. On one secret ballot, you can privately add one extra vote to a player.",
   Nurse: "Once per match, stop the entire Vampire attack for one night. You spend the save when it resolves, even if there was no attack. You never learn who was targeted.",
-  Lookout: "You win with the Vampires. On Nights 2, 4, 6 and so on, you can learn who the Vampires tried to kill. If a Doctor protects that player, the attack can shift once to another target.",
+  Lookout: "You win with the Vampires. On even nights, wait for the other choices to lock, then watch the attack to learn who the Vampires targeted. If a Doctor protects that player, the attack can shift once.",
   Usurper: "Mark several living players on one night. If the town later votes out one of your marks while you are alive and you voted for them too, you win individually. The match continues.",
 };
 
@@ -51,7 +52,11 @@ const ONE_USE_ROLES = new Set(["Hunter", "Thief", "Silencer", "Seer", "Nurse", "
 const TARGETLESS_NIGHT_ROLES = new Set(["Nurse", "Lookout"]);
 const FIRST_NIGHT_BONUS_MS = 20000;
 const NIGHT_EXTENSION_MS = 15000;
+const NIGHT_OVERTIME_MS = 10000;
+const LOOKOUT_TURN_MS = 10000;
 const QUIET_NIGHT_LIMIT = 3;
+const DISCUSSION_LIMIT = 40;
+const BOT_LINES_PER_DAY = 6;
 const MAX_SECRET_BALLOTS = 3;
 const OATH_MODES = ["off", "random-town", "random-any", "town", "non-evil", "evil", "everyone"];
 const OPTIONAL_RULES = {
@@ -87,7 +92,7 @@ function makeDefaultRoleConfig() {
   return config;
 }
 
-function createRoom(io, code, hostSession, timing, practice = false) {
+function createRoom(io, code, hostSession, timing, practice = false, speakWithLuna = null) {
   const players = new Map();
   const socketToPlayerId = new Map();
   const tableSession = randomUUID();
@@ -97,6 +102,9 @@ function createRoom(io, code, hostSession, timing, practice = false) {
   let hostTimer;
   let botTimer;
   let botClock;
+  let discussionTimer;
+  let pendingDiscussion;
+  let messageId = 0;
   let nextBotNumber = 1;
   let emptySince = Date.now();
 
@@ -116,14 +124,18 @@ function createRoom(io, code, hostSession, timing, practice = false) {
     extensionVotes: new Set(),
     nightExtended: false,
     nightKey: null,
+    nightStage: null,
     pendingThefts: [],
     clock: null,
     dayVotes: {},
+    ballotKey: null,
     secretBallot: false,
     fogBoosts: new Map(),
     doctorLastSave: {},
     detectiveMemory: {},
     messages: [],
+    discussion: [],
+    botConversation: null,
     tableCues: [],
     gameOver: null,
   };
@@ -204,6 +216,7 @@ function createRoom(io, code, hostSession, timing, practice = false) {
       phase: game.phase,
       dayNumber: game.dayNumber,
       nightNumber: game.nightNumber,
+      nightStage: game.phase === "night" ? game.nightStage : null,
       playerCount: getAllPlayers().length,
       aliveCount: getAlivePlayers().length,
       votingOpen: isVotingOpen(),
@@ -249,6 +262,82 @@ function createRoom(io, code, hostSession, timing, practice = false) {
     return getAlivePlayers().filter((player) => player !== me && player.role !== "Villager");
   }
 
+  function appendDiscussion(player, text, automated = false) {
+    game.discussion.push({
+      id: ++messageId, dayNumber: game.dayNumber, playerId: player.id,
+      name: player.name, text, automated,
+    });
+    if (game.discussion.length > DISCUSSION_LIMIT) game.discussion.shift();
+    const update = { roomCode: code, dayNumber: game.dayNumber, messages: game.discussion };
+    for (const participant of players.values()) {
+      if (participant.connected && participant.socketId) io.to(participant.socketId).emit("discussionUpdate", update);
+    }
+  }
+
+  function botPerspective(bot) {
+    const onVampireTeam = roleOutcome(bot.role).winner === "Vampires";
+    const eligible = getAlivePlayers().filter((player) => canVoteFor(bot, player.id));
+    const nonAllies = eligible.filter((player) => bot.role !== "Vampire" || roleOutcome(player.role).winner !== "Vampires");
+    const candidates = (nonAllies.length ? nonAllies : eligible).map(({ id, name, publicRole }) => ({ id, name, publicRole }));
+    const perspective = { id: bot.id, name: bot.name, onVampireTeam, preferredTargets: bot.role === "Usurper" ? bot.usurperMarks : [] };
+    return { perspective, opinion: formOpinion(perspective, candidates, game.discussion) };
+  }
+
+  function nextBotSpeaker() {
+    const conversation = game.botConversation;
+    if (game.phase !== "day" || emptySince !== null || !conversation || conversation.lines >= BOT_LINES_PER_DAY) return null;
+
+    const bots = getAlivePlayers().filter((player) => isAutomaticBot(player) && canAct(player));
+    const responders = bots.filter((bot) => !conversation.responded.has(bot.id));
+    const reply = game.discussion.findLast((entry) => !entry.automated && entry.dayNumber === game.dayNumber
+      && entry.id > conversation.lastReply);
+    if (reply && responders.length) {
+      const named = bots.find((bot) => mentionsPlayer(reply.text, bot.name));
+      const bot = named ? responders.find((candidate) => candidate === named) : responders[randomInt(responders.length)];
+      if (bot) return { bot, reply };
+    }
+    if (conversation.opened.size >= 3) return null;
+    const openers = bots.filter((bot) => !conversation.opened.has(bot.id));
+    return openers.length ? { bot: openers[randomInt(openers.length)] } : null;
+  }
+
+  function scheduleBotDiscussion() {
+    if (game.phase !== "day" || emptySince !== null) {
+      clearTimeout(discussionTimer);
+      discussionTimer = null;
+      return;
+    }
+    if (discussionTimer || pendingDiscussion === game.botConversation || !nextBotSpeaker()) return;
+
+    const conversation = game.botConversation;
+    discussionTimer = setTimeout(() => {
+      discussionTimer = null;
+      const next = game.botConversation === conversation && nextBotSpeaker();
+      if (!next) return;
+      const { bot, reply } = next;
+      if (reply) {
+        conversation.lastReply = reply.id;
+        conversation.responded.add(bot.id);
+      } else {
+        conversation.opened.add(bot.id);
+      }
+      conversation.lines += 1;
+      const { perspective, opinion } = botPerspective(bot);
+      const fallback = writeDiscussionLine(perspective, opinion, game.dayNumber, reply);
+      const publish = (text) => {
+        if (pendingDiscussion === conversation) pendingDiscussion = null;
+        if (game.botConversation !== conversation || game.phase !== "day" || emptySince !== null) return;
+        if (canAct(bot) && isAutomaticBot(bot)) appendDiscussion(bot, text || fallback, true);
+        scheduleBotDiscussion();
+      };
+      if (speakWithLuna) {
+        pendingDiscussion = conversation;
+        const messages = game.discussion.slice(-8).map(({ name, text }) => ({ name, text }));
+        speakWithLuna({ speaker: bot.name, suggestedTarget: opinion?.player.name, fallback, messages }).then(publish, () => publish(null));
+      } else publish(null);
+    }, 1800);
+  }
+
   // Public state builder and sync
   function buildStateFor(playerId) {
     const me = getPlayer(playerId);
@@ -259,6 +348,7 @@ function createRoom(io, code, hostSession, timing, practice = false) {
       clock: game.clock,
       timing,
       practice,
+      lunaDiscussion: practice && Boolean(speakWithLuna),
       phase: game.phase,
       hasStarted: game.hasStarted,
       dayNumber: game.dayNumber,
@@ -273,10 +363,13 @@ function createRoom(io, code, hostSession, timing, practice = false) {
       deadlockDraw: game.deadlockDraw,
       rules: game.rules,
       nightKey: game.phase === "night" ? game.nightKey : null,
+      nightStage: game.phase === "night" ? game.nightStage : null,
       votingOpen: isVotingOpen(),
+      ballotKey: isVotingOpen() ? game.ballotKey : null,
       secretBallot: game.secretBallot,
       votesCast: game.secretBallot ? null : Object.keys(game.dayVotes).length,
       messages: game.messages.slice(-30),
+      discussion: game.discussion,
       gameOver: game.gameOver,
       selectedRoleCount: countSelectedRoles(),
       playerCount: getAllPlayers().length,
@@ -326,9 +419,10 @@ function createRoom(io, code, hostSession, timing, practice = false) {
             } : null,
             privateMessages: me.privateMessages.slice(-10),
             nightComplete: game.nightChoices.has(me.id),
+            nightCanChoose: game.phase === "night" && me.alive && canTakeNightTurn(me),
             nightPickCount: nightPickCount(nightRole(me)),
             nightAbility: game.phase === "night" && TARGETLESS_NIGHT_ROLES.has(nightRole(me)) ? me.role : null,
-            nightExtension: game.phase === "night" ? {
+            nightExtension: game.phase === "night" && game.nightStage === "choosing" && !game.clock?.overtimeUntil ? {
               required: Math.ceil(game.startingPlayerCount / 3),
               votes: game.extensionVotes.size,
               voted: game.extensionVotes.has(me.id),
@@ -339,6 +433,7 @@ function createRoom(io, code, hostSession, timing, practice = false) {
             nightTargetIds: game.phase === "night" && me.alive
               ? nightTargets(me, nightRole(me)).map(({ id }) => id) : [],
             dayVoteTarget: game.dayVotes[me.id] || null,
+            dayVoteAbstained: Object.hasOwn(game.dayVotes, me.id) && game.dayVotes[me.id] === null,
             fogmaster: me.role === "Fogmaster" ? {
               ballotsLeft: MAX_SECRET_BALLOTS - me.fogBallotsUsed,
               boostUsed: me.fogBoostUsed,
@@ -353,7 +448,10 @@ function createRoom(io, code, hostSession, timing, practice = false) {
   function emitAll() {
     for (const player of players.values()) emitPlayer(player);
     io.to(tableRoom).emit("tableState", buildTableState());
-    if (practice) scheduleBotActions();
+    if (practice) {
+      scheduleBotActions();
+      scheduleBotDiscussion();
+    }
   }
 
   function emitPlayer(player) {
@@ -491,6 +589,18 @@ function createRoom(io, code, hostSession, timing, practice = false) {
       ? player.role : null;
   }
 
+  function canTakeNightTurn(player) {
+    return (nightRole(player) === "Lookout") === (game.nightStage === "lookout");
+  }
+
+  function missingNightChoices() {
+    return getAlivePlayers().filter((player) => canTakeNightTurn(player) && !game.nightChoices.has(player.id));
+  }
+
+  function hasLookoutTurn() {
+    return getAlivePlayers().some((player) => nightRole(player) === "Lookout");
+  }
+
   function nightPickCount(role) {
     if (role === "Usurper") return Math.floor((game.startingPlayerCount - 1) / 2);
     return role === "Transporter" ? 2 : 1;
@@ -505,7 +615,7 @@ function createRoom(io, code, hostSession, timing, practice = false) {
     });
   }
 
-  function nextBotNightChoice(bot) {
+  function automaticNightChoice(bot) {
     const role = nightRole(bot);
     const candidates = nightTargets(bot, role);
     const pickCount = nightPickCount(role);
@@ -526,7 +636,7 @@ function createRoom(io, code, hostSession, timing, practice = false) {
   function scheduleBotActions() {
     const atNight = game.phase === "night";
     const needsChoice = (bot) => isAutomaticBot(bot)
-      && (atNight ? !game.nightChoices.has(bot.id) : !game.dayVotes[bot.id]);
+      && (atNight ? canTakeNightTurn(bot) && !game.nightChoices.has(bot.id) : !Object.hasOwn(game.dayVotes, bot.id));
     const botsDue = (atNight || isVotingOpen()) && getAlivePlayers().some(needsChoice);
     const clock = botsDue && emptySince === null ? game.clock : null;
     if (clock === botClock) return;
@@ -535,25 +645,25 @@ function createRoom(io, code, hostSession, timing, practice = false) {
     botClock = clock;
     if (!clock) return;
 
-    const delay = Math.min(atNight ? 4000 : 5500, Math.floor((clock.deadline - Date.now()) / 2));
+    const deadline = clock.overtimeUntil || clock.deadline;
+    const delay = Math.min(atNight ? 4000 : 5500, Math.floor((deadline - Date.now()) / 2));
     botTimer = setTimeout(() => {
       botClock = null;
-      if (game.clock !== clock || clock.deadline <= Date.now()) return;
+      if (game.clock !== clock || deadline <= Date.now()) return;
       for (const bot of getAlivePlayers()) {
         if (game.clock !== clock) break;
         if (!needsChoice(bot)) continue;
         if (atNight) {
-          submitNightAction(bot, { ...nextBotNightChoice(bot), nightKey: game.nightKey }, true);
+          submitNightAction(bot, { ...automaticNightChoice(bot), nightKey: game.nightKey }, true);
           emitPlayer(bot);
         } else {
-          revealMayor(bot);
-          const candidates = getAlivePlayers().filter((player) => canVoteFor(bot, player.id));
-          const marked = candidates.filter(({ id }) => bot.role === "Usurper" && bot.usurperMarks.includes(id));
-          submitVote(bot, chooseTarget(marked.length ? marked : candidates).targetId);
+          const { opinion } = botPerspective(bot);
+          submitVote(bot, opinion?.player.id ?? null);
         }
       }
-      if (atNight) scheduleBotActions();
-      else emitAll();
+      if (atNight) {
+        if (!advanceAfterNightChoice()) scheduleBotActions();
+      } else emitAll();
     }, Math.max(50, delay));
   }
 
@@ -562,13 +672,13 @@ function createRoom(io, code, hostSession, timing, practice = false) {
     game.clock = null;
   }
 
-  function startClock(duration, onExpire, deadline = Date.now() + duration) {
+  function startClock(duration, onExpire, deadline = Date.now() + duration, overtimeUntil) {
     stopClock();
-    game.clock = { deadline, duration };
+    game.clock = overtimeUntil ? { deadline, duration, overtimeUntil } : { deadline, duration };
     phaseTimer = setTimeout(() => {
       onExpire();
       emitAll();
-    }, Math.max(0, deadline - Date.now()));
+    }, Math.max(0, (overtimeUntil || deadline) - Date.now()));
   }
 
   // Lobby, role assignment, reset, and game over
@@ -601,6 +711,7 @@ function createRoom(io, code, hostSession, timing, practice = false) {
       role: null, alive, mayorRevealed: false, abilityUsed: false, personalWin: null,
       oath: null, publicRole: null, privateMessages: [], fogBallotsUsed: 0, fogBoostUsed: false,
       usurperMarks: [],
+      lastDiscussionAt: null,
     });
   }
 
@@ -663,6 +774,7 @@ function createRoom(io, code, hostSession, timing, practice = false) {
     game.doctorLastSave = {};
     game.detectiveMemory = {};
     game.messages = [];
+    game.discussion = [];
     game.tableCues = [];
     game.gameOver = null;
 
@@ -698,13 +810,17 @@ function createRoom(io, code, hostSession, timing, practice = false) {
     game.extensionVotes.clear();
     game.nightExtended = false;
     game.nightKey = null;
+    game.nightStage = null;
     game.pendingThefts = [];
     game.dayVotes = {};
+    game.ballotKey = null;
     game.secretBallot = false;
     game.fogBoosts.clear();
     game.doctorLastSave = {};
     game.detectiveMemory = {};
     game.messages = [];
+    game.discussion = [];
+    game.botConversation = null;
     game.tableCues = [];
     game.gameOver = null;
 
@@ -788,11 +904,13 @@ function createRoom(io, code, hostSession, timing, practice = false) {
   function startNight() {
     applyRoleThefts();
     game.phase = "night";
+    game.nightStage = "choosing";
     game.nightNumber += 1;
     game.nightChoices.clear();
     game.extensionVotes.clear();
     game.nightExtended = false;
     game.dayVotes = {};
+    game.ballotKey = null;
     game.secretBallot = false;
     game.fogBoosts.clear();
     game.nightKey = randomUUID();
@@ -803,7 +921,44 @@ function createRoom(io, code, hostSession, timing, practice = false) {
       : `Night ${game.nightNumber}. Everyone has ${Math.ceil(duration / 1000)} seconds to make a private choice.`;
     pushMessage(message);
     announceToTable(message);
-    startClock(duration, resolveNight);
+    startClock(duration, expireNightTurn);
+  }
+
+  function finishNightTurn() {
+    if (game.nightStage === "choosing" && hasLookoutTurn()) {
+      game.nightStage = "lookout";
+      announceToTable("The other choices are locked. Waiting for the final night choice.");
+      startClock(LOOKOUT_TURN_MS, expireNightTurn);
+      return;
+    }
+    resolveNight();
+  }
+
+  function expireNightTurn() {
+    const waiting = missingNightChoices();
+    const { deadline, duration, overtimeUntil } = game.clock;
+    if (waiting.length && !overtimeUntil && Date.now() < deadline + NIGHT_OVERTIME_MS) {
+      startClock(duration, expireNightTurn, deadline, deadline + NIGHT_OVERTIME_MS);
+      return;
+    }
+
+    completeNightChoices(waiting, "Time expired. The game submitted your night move automatically.");
+    finishNightTurn();
+  }
+
+  function completeNightChoices(waiting, message) {
+    for (const player of waiting) {
+      storeNightAction(player, automaticNightChoice(player), true);
+      if (!isAutomaticBot(player)) pushPrivateMessage(player.id, message);
+    }
+  }
+
+  function advanceAfterNightChoice() {
+    if (game.phase !== "night" || !(game.clock?.overtimeUntil || game.nightStage === "lookout" || hasLookoutTurn())
+      || missingNightChoices().length) return false;
+    finishNightTurn();
+    emitAll();
+    return true;
   }
 
   function remapTarget(playerId, transporterPairs) {
@@ -977,6 +1132,7 @@ function createRoom(io, code, hostSession, timing, practice = false) {
     game.phase = "day";
     game.dayNumber += 1;
     game.dayVotes = {};
+    game.botConversation = { opened: new Set(), responded: new Set(), lines: 0, lastReply: 0 };
     const discussion = `Day ${game.dayNumber}. Discuss what happened. The host will open voting when you’re ready.`;
     pushMessage(discussion);
     announceToTable(discussion);
@@ -990,11 +1146,11 @@ function createRoom(io, code, hostSession, timing, practice = false) {
   function allDayVotesSubmitted() {
     const aliveIds = getAlivePlayers().map((player) => player.id);
     if (aliveIds.length === 0) return false;
-    return aliveIds.every((playerId) => game.dayVotes[playerId]);
+    return aliveIds.every((playerId) => Object.hasOwn(game.dayVotes, playerId));
   }
 
   function isDeadlock() {
-    if (!game.deadlockDraw || !allDayVotesSubmitted()) return false;
+    if (!game.deadlockDraw || !allDayVotesSubmitted() || Object.values(game.dayVotes).includes(null)) return false;
     const roles = getAlivePlayers().map((player) => player.role);
     return roles.length === 3 && ["Vampire", "Jester", "Villager"].every((role) => roles.includes(role));
   }
@@ -1064,7 +1220,8 @@ function createRoom(io, code, hostSession, timing, practice = false) {
   }
 
   function canAct(player) {
-    return Boolean(player?.alive && activeMatch() && (game.clock ? Date.now() < game.clock.deadline : game.phase === "day"));
+    return Boolean(player?.alive && activeMatch()
+      && (game.clock ? Date.now() < (game.clock.overtimeUntil || game.clock.deadline) : game.phase === "day"));
   }
 
   function eliminate(player) {
@@ -1109,6 +1266,13 @@ function createRoom(io, code, hostSession, timing, practice = false) {
       return "The night has closed.";
     }
 
+    if (!canTakeNightTurn(player)) {
+      return game.nightStage === "lookout" ? "Your night turn is closed." : "Wait for the other players to finish first.";
+    }
+    return storeNightAction(player, payload, automatic);
+  }
+
+  function storeNightAction(player, payload, automatic) {
     const previous = game.nightChoices.get(player.id);
     if (payload.oath === true && !previous?.guess) {
       const error = recordAccuser(player, payload.targetId);
@@ -1156,12 +1320,12 @@ function createRoom(io, code, hostSession, timing, practice = false) {
   }
 
   function submitVote(voter, targetId) {
-    if (!isVotingOpen() || !canAct(voter)) return false;
-    if (!canVoteFor(voter, targetId)) return false;
+    if (!isVotingOpen() || !canAct(voter)) return "This ballot is closed.";
+    if (targetId !== null && !canVoteFor(voter, targetId)) return "Choose an eligible living player or abstain.";
 
     game.dayVotes[voter.id] = targetId;
     if (!game.secretBallot && allDayVotesSubmitted()) resolveVotes();
-    return true;
+    return null;
   }
 
   function canVoteFor(voter, targetId) {
@@ -1197,7 +1361,9 @@ function createRoom(io, code, hostSession, timing, practice = false) {
     if (!target || !ROLE_ORDER.includes(guess) || guess === "Villager") return "Choose a highlighted player and a role.";
     if (game.phase === "night") {
       const previous = game.nightChoices.get(seer.id);
-      if (payload.nightKey !== game.nightKey || previous?.guess || previous?.oath) return "Your choice is already locked or the night has closed.";
+      if (!canTakeNightTurn(seer) || payload.nightKey !== game.nightKey || previous?.guess || previous?.oath) {
+        return "Your choice is already locked or the night has closed.";
+      }
       game.nightChoices.set(seer.id, { targetId, guess });
     } else {
       if (payload.nightKey) return "The night has closed.";
@@ -1295,8 +1461,11 @@ function createRoom(io, code, hostSession, timing, practice = false) {
     },
 
     resolveNight(socket) {
-      if (!isHostSocket(socket)) return;
-      resolveNight();
+      if (!isHostSocket(socket) || game.phase !== "night" || game.nightStage === "lookout") return;
+      if (hasLookoutTurn() || game.clock?.overtimeUntil) {
+        completeNightChoices(missingNightChoices(), "The host closed the turn. The game submitted your night move automatically.");
+      }
+      finishNightTurn();
       emitAll();
     },
 
@@ -1305,6 +1474,7 @@ function createRoom(io, code, hostSession, timing, practice = false) {
       const message = `Voting is open. You have ${Math.ceil(timing.day / 1000)} seconds to vote on your phones.`;
       pushMessage(message);
       announceToTable(message);
+      game.ballotKey = randomUUID();
       startClock(timing.day, resolveVotes);
       emitAll();
     },
@@ -1312,13 +1482,14 @@ function createRoom(io, code, hostSession, timing, practice = false) {
     nightAction(socket, payload, acknowledge) {
       const player = getPlayer(socketToPlayerId.get(socket.id));
       const error = isAutomaticBot(player) ? "Take control before choosing an action." : submitNightAction(player, payload);
-      if (!error) emitPlayer(player);
+      if (!error && !advanceAfterNightChoice()) emitPlayer(player);
       if (typeof acknowledge === "function") acknowledge(error);
     },
 
     voteNightExtension(socket, nightKey) {
       const player = getPlayer(socketToPlayerId.get(socket.id));
-      if (game.phase !== "night" || nightKey !== game.nightKey || !canAct(player) || isAutomaticBot(player)
+      if (game.phase !== "night" || game.nightStage !== "choosing" || game.clock?.overtimeUntil
+        || nightKey !== game.nightKey || !canAct(player) || isAutomaticBot(player)
         || game.nightExtended || game.extensionVotes.has(player.id)) return;
 
       game.extensionVotes.add(player.id);
@@ -1328,7 +1499,7 @@ function createRoom(io, code, hostSession, timing, practice = false) {
         pushMessage(message);
         announceToTable(message);
         const { duration, deadline } = game.clock;
-        startClock(duration + NIGHT_EXTENSION_MS, resolveNight, deadline + NIGHT_EXTENSION_MS);
+        startClock(duration + NIGHT_EXTENSION_MS, expireNightTurn, deadline + NIGHT_EXTENSION_MS);
       }
       emitAll();
     },
@@ -1353,7 +1524,9 @@ function createRoom(io, code, hostSession, timing, practice = false) {
       const atNight = game.phase === "night";
       const error = isAutomaticBot(player) ? "Take control before guessing." : submitSeerGuess(player, payload);
       if (!error) {
-        if (atNight) emitPlayer(player);
+        if (atNight) {
+          if (!advanceAfterNightChoice()) emitPlayer(player);
+        }
         else emitAll();
       }
       if (typeof acknowledge === "function") acknowledge(error);
@@ -1379,16 +1552,43 @@ function createRoom(io, code, hostSession, timing, practice = false) {
       emitAll();
     },
 
-    revealMayor(socket) {
+    revealMayor(socket, acknowledge) {
       const player = getPlayer(socketToPlayerId.get(socket.id));
-      if (!isAutomaticBot(player) && revealMayor(player)) emitAll();
+      const revealed = !isAutomaticBot(player) && revealMayor(player);
+      if (revealed) emitAll();
+      if (typeof acknowledge === "function") acknowledge(revealed ? null : "You can’t reveal as Mayor right now.");
     },
 
-    vote(socket, payload) {
+    vote(socket, payload, acknowledge) {
       const voter = getPlayer(socketToPlayerId.get(socket.id));
-      if (isAutomaticBot(voter) || !submitVote(voter, payload?.targetId)) return;
-      if (game.secretBallot) emitPlayer(voter);
-      else emitAll();
+      let error;
+      if (isAutomaticBot(voter)) error = "Take control before voting.";
+      else if (!isVotingOpen() || payload?.ballotKey !== game.ballotKey) error = "This ballot is closed.";
+      else error = submitVote(voter, payload.abstain === true ? null : payload.targetId ?? undefined);
+      if (!error) {
+        if (game.secretBallot) emitPlayer(voter);
+        else emitAll();
+      }
+      if (typeof acknowledge === "function") acknowledge(error);
+    },
+
+    discuss(socket, payload, acknowledge) {
+      const player = getPlayer(socketToPlayerId.get(socket.id));
+      const text = typeof payload?.text === "string" && payload.text.length <= 240 ? payload.text.trim().replace(/\s+/g, " ") : "";
+      const now = Date.now();
+      let error = null;
+      if (game.phase !== "day" || payload?.dayNumber !== game.dayNumber || !player?.alive || isAutomaticBot(player)) {
+        error = "Only living players can post during the day.";
+      } else if (!text) {
+        error = "Enter a message of 240 characters or fewer.";
+      } else if (typeof player.lastDiscussionAt === "number" && now - player.lastDiscussionAt < 1200) {
+        error = "Give others a moment before posting again.";
+      } else {
+        player.lastDiscussionAt = now;
+        appendDiscussion(player, text);
+        if (practice) scheduleBotDiscussion();
+      }
+      if (typeof acknowledge === "function") acknowledge(error);
     },
 
     openSecretBallot(socket, payload, acknowledge) {
@@ -1440,6 +1640,8 @@ function createRoom(io, code, hostSession, timing, practice = false) {
       stopClock();
       clearTimeout(hostTimer);
       clearTimeout(botTimer);
+      clearTimeout(discussionTimer);
+      game.botConversation = null;
       if (practice) {
         for (const bot of players.values()) {
           if (bot.isBot) detachPlayerSocket(bot, "This practice room has closed.");

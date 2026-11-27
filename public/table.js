@@ -172,13 +172,13 @@ tableSocket.on("tableState", (state) => {
   document.body.dataset.phase = state.phase;
   if (state.phase === "night") {
     phaseLabel.textContent = `Room ${roomCode} · Night ${state.nightNumber}`;
-    turnLabel.textContent = "Make a private choice";
-    progressLabel.textContent = "";
+    turnLabel.textContent = state.nightStage === "lookout" ? "Waiting for the final night choice" : "Make a private choice";
+    progressLabel.textContent = state.clock?.overtimeUntil ? "Overtime. The game will fill in any missing choices." : "";
   } else if (state.phase === "day") {
     phaseLabel.textContent = `Room ${roomCode} · Day ${state.dayNumber}`;
     if (state.votingOpen) {
       turnLabel.textContent = state.secretBallot ? "Secret ballot" : "Voting is open";
-      progressLabel.textContent = state.secretBallot ? "Cast your private vote on your phone." : `${state.votesCast} of ${state.aliveCount} votes in`;
+      progressLabel.textContent = state.secretBallot ? "Cast your private vote on your phone." : `${state.votesCast} of ${state.aliveCount} ballots in`;
     } else {
       turnLabel.textContent = "Discuss what happened";
       progressLabel.textContent = "The host will open voting when you’re ready.";
@@ -204,7 +204,8 @@ tableSocket.on("tableState", (state) => {
   }
   seenCueId = lastCue?.id || 0;
   gameClock.set(state.clock, state.serverTime);
-  document.getElementById("table-clock").innerHTML = gameClock.markup(state.phase === "day" ? "Voting ends in" : "Night ends in");
+  const clockLabel = state.clock?.overtimeUntil ? "Overtime" : state.phase === "day" ? "Voting ends in" : "Night ends in";
+  document.getElementById("table-clock").innerHTML = gameClock.markup(clockLabel);
   gameClock.refresh();
   cueList.replaceChildren(...state.cues.slice().reverse().map(({ text }) => {
     const item = document.createElement("li");

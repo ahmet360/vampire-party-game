@@ -65,7 +65,20 @@
           </div>
           <div id="top-player-list" class="player-list"></div>
         </header>
-        <main id="app"></main>
+        <main>
+          <div id="app-status"></div>
+          <section id="discussion-panel" class="card hidden" aria-labelledby="discussion-title">
+            <h2 id="discussion-title">Player discussion</h2>
+            <p id="discussion-provider" class="muted hidden">Messages in this practice room may be sent to OpenAI for bot replies.</p>
+            <p id="discussion-empty" class="muted">No messages yet.</p>
+            <div id="discussion-log" class="discussion-log" role="log" aria-label="Player messages"></div>
+            <form id="discussion-form" class="discussion-form">
+              <input id="discussion-input" aria-label="Message the room" placeholder="Message the room" maxlength="240" required />
+              <button id="discussion-submit" class="secondary" type="submit">Send</button>
+            </form>
+          </section>
+          <div id="app"></div>
+        </main>
         <section id="role-descriptions"></section>
       </div>
       <main id="night-panel" class="night-panel hidden"></main>
@@ -76,7 +89,7 @@
       <header class="board-toolbar">
         <div>
           <h2 id="board-title">Practice board</h2>
-          <p>Make choices on each player screen. Turn on Auto-play for any bot you want to play itself.</p>
+          <p>Make choices on each player screen. Turn on Auto-play to let a bot make choices and join the discussion.</p>
         </div>
         <button id="close-board" type="button" class="secondary">Hide board</button>
       </header>

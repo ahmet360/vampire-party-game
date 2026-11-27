@@ -1,14 +1,15 @@
 const gameClock = (() => {
   let end = 0;
   let duration = 0;
+  let overdue = false;
 
   function refresh() {
     const element = document.querySelector("[data-game-clock]");
     if (!element || !duration) return;
-    const remaining = Math.max(0, end - performance.now());
-    const seconds = Math.ceil(remaining / 1000);
+    const remaining = end - performance.now();
+    const seconds = overdue ? Math.floor(Math.min(0, remaining) / 1000) : Math.ceil(Math.max(0, remaining) / 1000);
     element.querySelector("output").textContent = `${seconds}s`;
-    element.querySelector("progress").value = remaining;
+    element.querySelector("progress").value = Math.max(0, remaining);
     element.classList.toggle("clock-urgent", seconds <= 5);
   }
 
@@ -17,7 +18,8 @@ const gameClock = (() => {
   return {
     set(clock, serverTime) {
       duration = clock?.duration || 0;
-      end = clock ? performance.now() + Math.max(0, clock.deadline - serverTime) : 0;
+      overdue = Boolean(clock?.overtimeUntil);
+      end = clock ? performance.now() + clock.deadline - serverTime : 0;
       refresh();
     },
     markup(label) {

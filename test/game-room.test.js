@@ -1,7 +1,15 @@
 const assert = require("node:assert/strict");
 const test = require("node:test");
 const { createRoom } = require("../game-room");
+const { createLunaSpeaker } = require("../luna-discussion");
 const FIRST_NIGHT = 20800;
+
+function cast(send, player, targetId, ballotKey = player.state.ballotKey) {
+  let result;
+  const choice = targetId === null ? { abstain: true } : { targetId };
+  send(player, "vote", { ...choice, ballotKey }, (error) => { result = error; });
+  return result;
+}
 
 function roomFixture(t, practice = true) {
   const sockets = new Map();
@@ -138,6 +146,8 @@ test("manual bots can sit out while attached and resume automatic choices on dis
   assert.equal(reopened.state.me.botAuto, false);
   assert.deepEqual(reopened.state.me.privateMessages, []);
   assert.equal(host.state.phase, "night");
+  if (host !== vampireWindow) pick(send, host, { skip: true });
+  pick(send, reopened, { skip: true });
   t.mock.timers.tick(FIRST_NIGHT - 8000);
   assert.equal(host.state.phase, "day");
   assert.equal(host.state.aliveCount, 4);
@@ -150,7 +160,7 @@ test("manual bots can sit out while attached and resume automatic choices on dis
   startVoting(send, host);
   t.mock.timers.tick(600);
   assert.equal(host.state.votesCast, 3);
-  send(host, "vote", { targetId: villager.id });
+  cast(send, host, villager.id);
   assert.notEqual(host.state.phase, "day");
 });
 
@@ -201,7 +211,7 @@ test("taking over during night replaces automatic choices without changing the s
   send(firstTile, "setBotAuto", false);
   assert.equal(firstTile.state.me.nightComplete, true);
   assert.equal(host.state.phase, "night");
-  t.mock.timers.tick(FIRST_NIGHT - 4000);
+  t.mock.timers.tick(FIRST_NIGHT - 4000 + 10000);
   assert.equal(host.state.phase, "day");
 });
 
@@ -228,6 +238,9 @@ test("every open practice tile stays manual across automatic bot timing", (t) =>
   pick(send, tiles[2], { skip: true });
   assert.equal(tiles[3].state.me.nightComplete, false);
   t.mock.timers.tick(80);
+  assert.equal(host.state.phase, "night");
+  assert.ok(host.state.clock.overtimeUntil);
+  t.mock.timers.tick(10000);
   assert.equal(host.state.phase, "day");
   assert.equal(host.state.clock, null);
 });
@@ -240,13 +253,14 @@ test("discussion stays open for an hour and only the host can start voting once"
   const vampire = find("Vampire");
   send(host, "startVoting", 0);
   assert.equal(host.state.phase, "night");
+  for (const player of players) pick(send, player, { skip: true });
   t.mock.timers.tick(FIRST_NIGHT);
   assert.equal(host.state.votingOpen, false);
   assert.equal(room.buildTableState().clock, null);
   send(players[1], "startVoting", 1);
   send(host, "startVoting", 0);
   send(host, "resolveVotes");
-  send(villager, "vote", { targetId: id(vampire) });
+  cast(send, villager, id(vampire));
   assert.equal(villager.state.me.dayVoteTarget, null);
   t.mock.timers.tick(60 * 60 * 1000);
   assert.equal(host.state.dayNumber, 1);
@@ -266,7 +280,7 @@ test("discussion stays open for an hour and only the host can start voting once"
   startVoting(send, host);
   assert.equal(host.state.clock, clock);
   assert.equal(room.buildTableState().cues.filter(({ text }) => text.startsWith("Voting is open")).length, 1);
-  send(villager, "vote", { targetId: id(vampire) });
+  cast(send, villager, id(vampire));
   t.mock.timers.tick(1100);
   assert.equal(host.state.gameOver.winner, "Villagers");
 });
@@ -387,7 +401,7 @@ test("Jesters know each other but each earns their own win", (t) => {
   const eliminateWithVotes = (target) => {
     startVoting(send, host);
     for (const player of players.filter(({ state }) => state.me.alive)) {
-      send(player, "vote", { targetId: id(player === target ? villager : target) });
+      cast(send, player, id(player === target ? villager : target));
     }
   };
   eliminateWithVotes(first);
@@ -412,7 +426,7 @@ test("Vampire allies share the team victory and only successful Jesters win alon
   assert.equal(host.state.roleWinGoals.Jester, "Personal goal");
   send(host, "resolveNight");
   startVoting(send, host);
-  for (const player of players) send(player, "vote", { targetId: id(player === winningJester ? villager : winningJester) });
+  for (const player of players) cast(send, player, id(player === winningJester ? villager : winningJester));
   pick(send, vampire, { targetId: id(villager) });
   send(host, "resolveNight");
   assert.equal(host.state.gameOver.winner, "Vampires");
@@ -431,9 +445,9 @@ for (const deadlockDraw of [true, false]) {
     const villager = find("Villager");
     send(host, "resolveNight");
     startVoting(send, host);
-    send(vampire, "vote", { targetId: id(villager) });
-    send(jester, "vote", { targetId: id(vampire) });
-    send(villager, "vote", { targetId: id(jester) });
+    cast(send, vampire, id(villager));
+    cast(send, jester, id(vampire));
+    cast(send, villager, id(jester));
     assert.equal(host.state.phase, deadlockDraw ? "gameover" : "night");
     assert.equal(host.state.gameOver?.winner, deadlockDraw ? "Draw" : undefined);
   });
@@ -469,13 +483,13 @@ test("the Oath binds the accuser, shields them and unlocks public reveal after t
   send(host, "resolveNight");
   assert.ok(accuser.state.me.alive);
   startVoting(send, host);
-  send(holder, "vote", { targetId: id(accuser) });
+  cast(send, holder, id(accuser));
   assert.equal(holder.state.me.dayVoteTarget, null);
   if (holder !== hunter) {
     send(hunter, "hunterShot", id(accuser));
   } else {
     for (const player of players.filter((player) => player !== holder && player !== accuser)) {
-      send(player, "vote", { targetId: id(accuser) });
+      cast(send, player, id(accuser));
     }
     send(host, "resolveVotes");
   }
@@ -559,7 +573,7 @@ test("the Fogmaster can open three secret ballots and use one private boost per 
   send(host, "resolveNight");
   assert.match(useFog(send, fog, "openSecretBallot"), /unavailable/);
   startVoting(send, host);
-  send(villager, "vote", { targetId: id(vampire) });
+  cast(send, villager, id(vampire));
   assert.equal(room.buildTableState().votesCast, 1);
   assert.match(useFog(send, villager, "openSecretBallot"), /unavailable/);
   assert.match(useFog(send, fog, "openSecretBallot", { dayNumber: 0 }), /unavailable/);
@@ -574,7 +588,7 @@ test("the Fogmaster can open three secret ballots and use one private boost per 
   assert.match(useFog(send, fog, "openSecretBallot"), /already open/);
 
   const received = villager.received;
-  send(vampire, "vote", { targetId: id(fog) });
+  cast(send, vampire, id(fog));
   assert.equal(villager.received, received);
   assert.match(useFog(send, fog, "boostFogVote", { targetId: id(fog) }), /available player/);
   assert.equal(useFog(send, fog, "boostFogVote", { targetId: id(vampire) }), null);
@@ -611,8 +625,8 @@ test("a secret ballot stays open until the deadline and the Fogmaster’s bonus 
   send(host, "resolveNight");
   startVoting(send, host);
   assert.equal(useFog(send, fog, "openSecretBallot"), null);
-  for (const player of [vampire, fog, second]) send(player, "vote", { targetId: id(first) });
-  for (const player of [first, third, fourth]) send(player, "vote", { targetId: id(vampire) });
+  for (const player of [vampire, fog, second]) cast(send, player, id(first));
+  for (const player of [first, third, fourth]) cast(send, player, id(vampire));
   assert.equal(host.state.phase, "day");
   assert.equal(useFog(send, fog, "boostFogVote", { targetId: id(vampire) }), null);
   t.mock.timers.tick(1199);
@@ -670,6 +684,7 @@ test("a third of the starting table can extend a night once without unlocking ac
   assert.deepEqual(room.buildTableState().clock, extended);
   assert.ok(host.state.me.nightComplete);
   assert.ok(!players[2].state.me.nightComplete);
+  for (const player of [rejoined, ...players.slice(2)]) pick(send, player, { skip: true });
   send(players[3], "voteNightExtension", firstNight);
   assert.equal(host.state.clock, extended);
   assert.equal(room.buildTableState().cues.filter(({ text }) => text.includes("added 15 seconds")).length, 1);
@@ -699,10 +714,14 @@ test("the Lookout can redirect a Doctor-saved attack once on an even night", (t)
   send(host, "resolveNight");
   send(host, "forceSleep");
   assert.equal(lookout.state.me.nightAbility, "Lookout");
+  pick(send, lookout, { ability: true }, /Wait for the other players/);
   pick(send, vampire, { targetId: id(original) });
   pick(send, doctor, { targetId: id(original) });
-  pick(send, lookout, { ability: true });
   send(host, "resolveNight");
+  assert.equal(host.state.nightStage, "lookout");
+  send(host, "resolveNight");
+  assert.equal(host.state.phase, "night");
+  pick(send, lookout, { ability: true });
 
   const dead = players.filter(({ state }) => !state.me.alive);
   assert.equal(dead.length, 1);
@@ -729,9 +748,9 @@ test("the Nurse saves anonymously, prevents a redirect, and spends the charge", 
   send(host, "forceSleep");
   pick(send, vampire, { targetId: id(target) });
   pick(send, doctor, { targetId: id(target) });
-  pick(send, lookout, { ability: true });
   pick(send, nurse, { ability: true });
   send(host, "resolveNight");
+  pick(send, lookout, { ability: true });
 
   assert.ok(players.every(({ state }) => state.me.alive));
   assert.equal(nurse.state.me.abilityUsed, true);
@@ -813,7 +832,7 @@ test("the Usurper must be alive and vote for the exiled mark to earn a personal 
   pick(send, usurper, { targetIds: [first, second, third].map(id) });
   send(host, "resolveNight");
   startVoting(send, host);
-  send(vampire, "vote", { targetId: id(first) });
+  cast(send, vampire, id(first));
   send(host, "resolveVotes");
   assert.ok(!first.state.me.alive);
   assert.doesNotMatch(usurper.state.me.privateMessages.at(-1).text, /earned/);
@@ -823,7 +842,7 @@ test("the Usurper must be alive and vote for the exiled mark to earn a personal 
   assert.doesNotMatch(usurper.state.me.privateMessages.at(-1).text, /earned/);
 
   startVoting(send, host);
-  send(usurper, "vote", { targetId: id(third) });
+  cast(send, usurper, id(third));
   send(host, "resolveVotes");
   assert.match(usurper.state.me.privateMessages.at(-1).text, /earned your Usurper win/);
   assert.equal(host.state.players.find(({ id: playerId }) => playerId === id(usurper)).personalWin, null);
@@ -871,4 +890,146 @@ test("a death resets the optional three-quiet-night draw counter", (t) => {
   runNight();
   assert.equal(host.state.gameOver.winner, "Draw");
   assert.match(host.state.gameOver.reason, /Three nights/);
+});
+
+test("one confirmed vote counts when the rest of the players abstain", (t) => {
+  const { host, players, find, send } = gameFixture(t, ["Vampire", "Mayor", "Villager", "Villager"]);
+  const vampire = find("Vampire");
+  const mayor = find("Mayor");
+  send(host, "resolveNight");
+  assert.match(cast(send, mayor, id(vampire)), /closed/);
+  startVoting(send, host);
+  assert.match(cast(send, mayor, id(vampire), "last-ballot"), /closed/);
+  assert.match(cast(send, mayor, id(mayor)), /eligible/);
+  assert.equal(cast(send, mayor, id(vampire)), null);
+  assert.equal(mayor.state.me.dayVoteTarget, id(vampire));
+  for (const player of players.filter((candidate) => candidate !== mayor)) assert.equal(cast(send, player, null), null);
+  assert.equal(host.state.gameOver.winner, "Villagers");
+});
+
+test("skipping and automatic voting never reveal a Mayor", (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1000 });
+  const { room, host, newSocket, send } = roomFixture(t);
+  for (let index = 0; index < 4; index++) send(host, "addBot");
+  send(host, "updateConfig", { role: "Mayor", enabled: true, count: 4 });
+  send(host, "startGame");
+  const token = host.state.bots.find(({ role }) => role === "Mayor").token;
+  const mayor = newSocket("manual-mayor");
+  assert.equal(room.joinBot(mayor, token), true);
+  pick(send, mayor, { skip: true });
+  assert.equal(mayor.state.me.mayorRevealed, false);
+  send(host, "resolveNight");
+  send(mayor, "setBotAuto", true);
+  startVoting(send, host);
+  t.mock.timers.tick(600);
+  assert.ok(mayor.state.me.dayVoteTarget);
+  assert.ok(host.state.players.every(({ mayorRevealed }) => !mayorRevealed));
+  send(mayor, "setBotAuto", false);
+  send(mayor, "revealMayor");
+  assert.equal(mayor.state.me.mayorRevealed, true);
+  assert.equal(room.buildTableState().cues.filter(({ text }) => text.includes("revealed as Mayor")).length, 1);
+});
+
+test("practice bots answer members of the room and stay quiet under manual control", (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1000 });
+  const { room, host, newSocket, send } = roomFixture(t);
+  const guest = newSocket("discussion-guest");
+  room.join(guest, "discussion-session", "Alex");
+  for (let index = 1; index <= 3; index++) {
+    send(host, "addBot");
+    assert.equal(room.joinBot(newSocket(`discussion-bot-${index}`), host.state.bots.at(-1).token), true);
+  }
+  const bot = newSocket("named-bot");
+  assert.equal(room.joinBot(bot, host.state.bots[0].token), true);
+  const { name } = bot.state.me;
+  send(host, "startGame");
+  send(host, "resolveNight");
+  let acknowledgement;
+  const note = (player, text) => send(player, "discuss", { dayNumber: host.state.dayNumber, text }, (error) => { acknowledgement = error; });
+  note(guest, `I suspect ${name}. What are you thinking?`);
+  assert.equal(acknowledgement, null);
+  note(guest, "Too soon.");
+  assert.match(acknowledgement, /moment/);
+  t.mock.timers.tick(1800);
+  assert.equal(host.discussionUpdate.messages.length, 1);
+  send(bot, "setBotAuto", true);
+  t.mock.timers.tick(1800);
+  const reply = host.discussionUpdate.messages.at(-1);
+  assert.equal(reply.name, name);
+  assert.equal(reply.automated, true);
+  assert.match(reply.text, /Alex, what made you suspect me/);
+  assert.deepEqual(guest.discussionUpdate.messages.at(-1), reply);
+  assert.equal(room.buildTableState().discussion, undefined);
+  send(host, "forceSleep");
+  note(guest, "Night message");
+  assert.match(acknowledgement, /during the day/);
+  t.mock.timers.tick(1800);
+  assert.equal(host.discussionUpdate.messages.at(-1).id, reply.id);
+});
+
+test("an idle Vampire gets negative overtime and an automatic choice", (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1000 });
+  const { room, host, players, find, send } = gameFixture(t, ["Vampire", "Villager", "Villager", "Villager"]);
+  const vampire = find("Vampire");
+  for (const player of players.filter((candidate) => candidate !== vampire)) pick(send, player, { skip: true });
+  const deadline = host.state.clock.deadline;
+  t.mock.timers.tick(FIRST_NIGHT);
+  assert.equal(host.state.clock.deadline, deadline);
+  assert.equal(host.state.clock.overtimeUntil, deadline + 10000);
+  assert.equal(room.buildTableState().clock.overtimeUntil, deadline + 10000);
+  assert.equal(vampire.state.me.nightComplete, false);
+  t.mock.timers.tick(9999);
+  assert.equal(host.state.phase, "night");
+  t.mock.timers.tick(1);
+  assert.equal(host.state.phase, "day");
+  assert.equal(host.state.aliveCount, 3);
+  assert.match(vampire.state.me.privateMessages.at(-1).text, /submitted your night move automatically/);
+});
+
+test("the Lookout waits for every other choice and gets its own overtime", (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1000 });
+  const { host, players, find, send } = gameFixture(t,
+    ["Vampire", "Lookout", "Doctor", "Villager", "Villager", "Villager"]);
+  const vampire = find("Vampire");
+  const lookout = find("Lookout");
+  const doctor = find("Doctor");
+  const target = find("Villager");
+  send(host, "resolveNight");
+  send(host, "forceSleep");
+  pick(send, vampire, { targetId: id(target) });
+  for (const player of players.filter((candidate) => ![vampire, lookout, doctor].includes(candidate))) pick(send, player, { skip: true });
+  t.mock.timers.tick(800);
+  assert.equal(lookout.state.me.nightCanChoose, false);
+  assert.ok(host.state.clock.overtimeUntil);
+  pick(send, doctor, { targetId: id(target) });
+  assert.equal(host.state.nightStage, "lookout");
+  assert.equal(lookout.state.me.nightCanChoose, true);
+  pick(send, doctor, { skip: true }, /turn is closed/);
+  t.mock.timers.tick(10000);
+  assert.ok(lookout.state.clock.overtimeUntil);
+  assert.equal(host.state.phase, "night");
+  t.mock.timers.tick(10000);
+  assert.equal(host.state.phase, "day");
+  assert.ok(lookout.state.me.privateMessages.some(({ text }) => text.includes("submitted your night move automatically")));
+  assert.ok(lookout.state.me.privateMessages.some(({ text }) => text.includes("the attack shifted")));
+});
+
+test("Luna requests use low reasoning and public context, with a fallback on errors", async () => {
+  assert.equal(createLunaSpeaker(""), null);
+  const input = { speaker: "Bot 1", suggestedTarget: "Pat", fallback: "I’m leaning toward Pat.", messages: [{ name: "Alex", text: "Ask Pat." }] };
+  const speaker = createLunaSpeaker("mock-key", async (url, options) => {
+    assert.equal(url, "https://api.openai.com/v1/responses");
+    assert.equal(options.headers.Authorization, "Bearer mock-key");
+    const body = JSON.parse(options.body);
+    assert.equal(body.model, "gpt-6-luna");
+    assert.deepEqual(body.reasoning, { effort: "low" });
+    assert.equal(body.store, false);
+    assert.deepEqual(JSON.parse(body.input).discussion, input.messages);
+    return { ok: true, json: async () => ({ output: [
+      { type: "reasoning" }, { type: "message", role: "assistant", content: [{ type: "output_text", text: "  Pat, what did you notice?  " }] },
+    ] }) };
+  });
+  assert.equal(await speaker(input), "Pat, what did you notice?");
+  const unavailable = createLunaSpeaker("mock-key", async () => ({ ok: false }));
+  assert.equal(await unavailable(input), null);
 });
