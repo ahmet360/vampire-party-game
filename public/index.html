@@ -1,66 +1,67 @@
-<!-- ##################################### 1 -->
-<!-- Document shell and metadata -->
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Vampire Social Deduction</title>
-
-  <!-- ##################################### 2 -->
-  <!-- Mobile dark UI styles -->
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="theme-color" content="#101019" />
+  <title>Vampire Party Game</title>
   <link rel="stylesheet" href="/styles.css" />
 </head>
-
 <body>
-  <!-- ##################################### 3 -->
-  <!-- Join screen -->
-  <div id="join-screen" class="screen join-wrap">
-    <section class="join-card">
-      <h1>Vampire</h1>
-      <p class="hint">
-        Enter your name to join. If you’re hosting, enter your host code too.
-      </p>
-
-      <form id="join-form">
-        <label>
-          Player name
-          <input id="name-input" type="text" placeholder="Enter your name" maxlength="24" required />
-        </label>
-
-        <label>
-          Host code
-          <input id="host-code-input" type="password" placeholder="Optional" autocomplete="off" />
-        </label>
-
-        <button class="primary" type="submit">Join Game</button>
-      </form>
-      <a class="subtle-link" href="/table">Open table announcer</a>
+  <main id="join-screen" class="join-wrap">
+    <section class="entry-art">
+      <div class="entry-title">
+        <p>Social deduction party game</p>
+        <h1>Vampire</h1>
+      </div>
     </section>
-  </div>
+    <section class="entry-form">
+      <div class="join-card">
+        <h2>Play Vampire</h2>
+        <p class="hint">Create a room and invite friends, or join them with a room code.</p>
+        <div class="room-mode" aria-label="Room action">
+          <button id="mode-create" type="button" aria-pressed="true">Create</button>
+          <button id="mode-join" type="button" aria-pressed="false">Join</button>
+        </div>
+        <form id="join-form">
+          <label>
+            Your name
+            <input id="name-input" type="text" placeholder="What should we call you?" maxlength="24" autocomplete="nickname" required />
+          </label>
+          <label id="room-code-field" class="hidden">
+            Room code
+            <input id="room-code-input" class="room-code-input" type="text" placeholder="6 characters" pattern="[A-Za-z2-9]{6}" maxlength="6" autocomplete="off" autocapitalize="characters" spellcheck="false" />
+          </label>
+          <button id="join-submit" class="primary" type="submit">Create room</button>
+          <p id="join-error" class="form-error hidden" role="alert"></p>
+        </form>
+        <a class="subtle-link" href="/table">Open table announcer</a>
+      </div>
+    </section>
+  </main>
 
-  <!-- ##################################### 4 -->
-  <!-- Game screen -->
   <div id="game-screen" class="screen hidden">
     <header class="top-bar">
       <div class="top-bar-title">
-        <strong>Vampire Game</strong>
+        <strong class="game-wordmark">Vampire</strong>
+        <div class="room-tools">
+          <span id="room-label" class="badge room-tag"></span>
+          <button id="share-room-btn" type="button">Copy invite</button>
+          <button id="leave-room-btn" type="button">Leave</button>
+        </div>
       </div>
-
       <div id="top-player-list" class="player-list"></div>
     </header>
-
     <main id="app"></main>
-
     <section id="role-descriptions"></section>
   </div>
 
   <main id="night-panel" class="night-panel hidden"></main>
+  <div id="phase-transition" class="phase-transition hidden" role="status"></div>
   <div id="toast" class="toast hidden" role="status"></div>
 
-  <!-- ##################################### 5 -->
-  <!-- Scripts -->
   <script src="/socket.io/socket.io.js"></script>
+  <script src="/clock.js"></script>
   <script src="/client.js"></script>
 </body>
 </html>

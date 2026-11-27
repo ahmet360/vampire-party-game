@@ -8,9 +8,12 @@ let joinDetails = null;
 let privateView = false;
 let pendingNightChoice = null;
 let savingTurn = false;
+let roomMode = "create";
+
+const invitedRoom = new URLSearchParams(location.search).get("room")?.toUpperCase() || "";
 
 const storedId = localStorage.getItem("vampirePlayerId");
-const playerId = storedId || makePlayerId();
+const playerId = /^[A-Za-z0-9_-]{22,80}$/.test(storedId || "") ? storedId : makePlayerId();
 localStorage.setItem("vampirePlayerId", playerId);
 
 function makePlayerId() {
@@ -18,7 +21,7 @@ function makePlayerId() {
     return window.crypto.randomUUID().replaceAll("-", "_");
   }
 
-  return `player_${Math.random().toString(36).slice(2)}_${Date.now()}`;
+  return Array.from(crypto.getRandomValues(new Uint8Array(20)), (value) => value.toString(16).padStart(2, "0")).join("");
 }
 
 // ##################################### 2
@@ -76,19 +79,105 @@ function showToast(message) {
 
 // ##################################### 3
 // Join screen handling
+function setRoomMode(mode) {
+  roomMode = mode;
+  const joining = mode === "join";
+  $("mode-create").setAttribute("aria-pressed", String(!joining));
+  $("mode-join").setAttribute("aria-pressed", String(joining));
+  $("room-code-field").classList.toggle("hidden", !joining);
+  $("room-code-input").required = joining;
+  $("room-code-input").disabled = !joining;
+  $("join-submit").textContent = joining ? "Join room" : "Create room";
+  $("join-error").classList.add("hidden");
+}
+
+$("mode-create").addEventListener("click", () => setRoomMode("create"));
+$("mode-join").addEventListener("click", () => setRoomMode("join"));
+if (invitedRoom) $("room-code-input").value = invitedRoom.slice(0, 6);
+setRoomMode(invitedRoom ? "join" : "create");
+
+try {
+  const previousRoom = JSON.parse(sessionStorage.getItem("vampireRoom"));
+  if (previousRoom?.code === invitedRoom && typeof previousRoom.name === "string") {
+    $("name-input").value = previousRoom.name;
+    joinDetails = { ...previousRoom, sessionId: playerId };
+  }
+} catch {
+  // A fresh form is still available when browser storage is unavailable.
+}
+
 $("join-form").addEventListener("submit", (event) => {
   event.preventDefault();
-
-  const name = $("name-input").value;
-  const hostCode = $("host-code-input").value;
-
-  joinDetails = { sessionId: playerId, name, hostCode };
-  socket.emit("join", joinDetails);
+  $("join-error").classList.add("hidden");
+  joinDetails = {
+    sessionId: playerId,
+    name: $("name-input").value.trim(),
+    code: roomMode === "join" ? $("room-code-input").value.trim().toUpperCase() : "",
+  };
+  if (!joinDetails.name) {
+    $("name-input").focus();
+    return showToast("Enter a name to play.");
+  }
+  socket.emit(roomMode === "join" ? "join" : "createRoom", joinDetails);
 });
 
 socket.on("connect", () => {
-  if (state?.me && joinDetails) socket.emit("join", joinDetails);
+  if (joinDetails?.code) socket.emit("join", joinDetails);
 });
+
+function roomLink(path = "/") {
+  const url = new URL(path, location.origin);
+  url.searchParams.set("room", state.roomCode);
+  return url.href;
+}
+
+async function copyInvite() {
+  const code = state.roomCode;
+  try {
+    await navigator.clipboard.writeText(roomLink());
+    showToast(`Invite copied for room ${code}.`);
+  } catch {
+    showToast(`Share room code ${code}.`);
+  }
+}
+
+$("share-room-btn").addEventListener("click", copyInvite);
+$("leave-room-btn").addEventListener("click", () => socket.emit("leaveRoom"));
+
+function returnToRooms(message) {
+  state = null;
+  joinDetails = null;
+  gameClock.set(null);
+  sessionStorage.removeItem("vampireRoom");
+  const url = new URL(location.href);
+  url.searchParams.delete("room");
+  history.replaceState(null, "", url);
+  document.body.removeAttribute("data-phase");
+  $("game-screen").classList.add("hidden");
+  $("night-panel").classList.add("hidden");
+  $("phase-transition").classList.add("hidden");
+  $("join-screen").classList.remove("hidden");
+  $("room-code-input").value = "";
+  setRoomMode("create");
+  if (message) showToast(message);
+}
+
+function showTransition(title, symbol, kind = "phase") {
+  const banner = $("phase-transition");
+  window.clearTimeout(showTransition.timer);
+  banner.classList.add("hidden");
+  banner.replaceChildren();
+  const mark = document.createElement("span");
+  mark.setAttribute("aria-hidden", "true");
+  mark.textContent = symbol;
+  const titleNode = document.createElement("strong");
+  titleNode.textContent = title;
+  banner.append(mark, titleNode);
+  banner.dataset.kind = kind;
+  void banner.offsetWidth;
+  banner.classList.remove("hidden");
+  showTransition.timer = window.setTimeout(() => banner.classList.add("hidden"), 1500);
+}
 
 document.addEventListener("visibilitychange", () => {
   if (document.hidden && privateView) hidePrivateView();
@@ -100,6 +189,8 @@ function render() {
   if (!state || !state.me) return;
 
   $("join-screen").classList.add("hidden");
+  document.body.dataset.phase = state.phase;
+  $("room-label").textContent = `Room ${state.roomCode}`;
   const atNight = state.phase === "night";
   $("night-panel").classList.toggle("hidden", !atNight);
   $("game-screen").classList.toggle("hidden", atNight);
@@ -107,6 +198,7 @@ function render() {
     $("app").replaceChildren();
     renderNightScreen();
     bindDynamicButtons();
+    gameClock.refresh();
     return;
   }
   $("night-panel").replaceChildren();
@@ -123,6 +215,7 @@ function render() {
   $("role-descriptions").innerHTML = renderRoleDescriptions();
 
   bindDynamicButtons();
+  gameClock.refresh();
 }
 
 function renderNightScreen() {
@@ -138,11 +231,13 @@ function renderNightScreen() {
 
   $("night-panel").innerHTML = `
     <section class="card night-cover">
-      <p class="muted">Night ${state.nightNumber}${turn ? ` · Turn ${turn.number} of ${turn.total}` : ""}</p>
+      <span class="phase-glyph" aria-hidden="true">☾</span>
+      <p class="round-label">Night ${state.nightNumber}${turn ? ` · Turn ${turn.number} of ${turn.total}` : ""}</p>
       <h1>${isOpen ? "Your private turn" : heading}</h1>
       ${isOpen ? `<button id="hide-private-btn" class="secondary">Cover screen</button>`
-        : `<p>${active ? `${escapeHtml(active.name)}${active.connected ? " is taking their turn." : " is reconnecting."}` : "The night is ending."}</p>
+        : `<p>${yourTurn ? "Open your turn to make a choice." : active ? `${escapeHtml(active.name)}${active.connected ? " is taking their turn." : " is reconnecting."}` : "The night is ending."}</p>
           ${yourTurn && !savingTurn ? `<button id="show-private-btn" class="primary">Open my turn</button>` : ""}`}
+      ${gameClock.markup("Turn ends in")}
     </section>
     ${isOpen ? `${renderRoleCard()}${pendingNightChoice ? renderNightConfirmation() : renderNightActions()}` : ""}
     ${!isOpen && state.me.isHost ? `
@@ -212,14 +307,14 @@ function renderStatusCard() {
       : "";
 
   return `
-    <section class="card">
+    <section class="card status-card ${state.phase === "day" ? "is-dawn" : ""}">
       <div class="card-title-row">
         <h2>${escapeHtml(phaseLabel(state.phase))}</h2>
         <span class="badge">${escapeHtml(roundText || `${state.playerCount} player${state.playerCount === 1 ? "" : "s"}`)}</span>
       </div>
       <p class="muted">Alive players: ${state.aliveCount}</p>
-      ${state.phase === "day" ? `<p>${state.votesCast} of ${state.aliveCount} votes in</p>` : ""}
-      ${state.phase === "lobby" ? `<p>Waiting for players. The host can configure roles and start the game.</p>` : ""}
+      ${state.phase === "day" ? `<p>${state.votesCast} of ${state.aliveCount} votes in</p>${gameClock.markup("Voting ends in")}` : ""}
+      ${state.phase === "lobby" ? `<p>Share the room code or invite link. Night turns last ${Math.ceil(state.timing.night / 1000)} seconds. A turn passes when time runs out.</p>` : ""}
       ${state.phase === "gameover" ? renderGameOverSummary() : ""}
     </section>
   `;
@@ -295,7 +390,7 @@ function renderHostControls() {
         <button id="end-game-btn" ${!state.hasStarted || state.phase === "gameover" ? "disabled" : ""}>End Game</button>
         <button id="reset-game-btn" class="danger">Reset Game</button>
       </div>
-      <a class="subtle-link" href="/table" target="_blank" rel="noopener">Open table announcer</a>
+      <a class="subtle-link" href="${escapeHtml(roomLink("/table"))}" target="_blank" rel="noopener">Open table announcer for this room</a>
       ${state.phase === "lobby" ? renderRoleConfig() : `<p class="muted">Role configuration is locked after the game starts.</p>`}
     </section>
   `;
@@ -349,8 +444,8 @@ function renderActionCard() {
   if (!state.me.alive) {
     return `
       <section class="card">
-        <h2>Actions</h2>
-        <p>You are dead. You can watch the rest of the game.</p>
+        <h2>Spectating</h2>
+        <p>Watch the rest of the round and rejoin when the host resets.</p>
       </section>
     `;
   }
@@ -368,14 +463,15 @@ function renderNightActions() {
   if (role === "Detective") return renderDetectiveAction();
   if (role === "Hunter" && !state.me.hunterUsed) return renderHunterAction();
   if (role === "Transporter") return renderTransporterAction();
+  const canWatch = role === "Villager" && !state.me.villagerWatchUsed;
 
   return `
     <section class="card action-card">
-      <h2>Keep watch</h2>
-      <p>Pick someone to remember during the day. Only you can see your choice.</p>
+      <h2>${canWatch ? "Keep watch" : "Cover turn"}</h2>
+      <p>${canWatch ? "Once per game, choose someone. If you survive, you’ll privately learn at dawn whether they used a targeted ability." : "Choose a player or pass to finish your private turn."}</p>
       <div class="target-grid">
         ${targetButtons(otherAlivePlayers(), "night", "watch")}
-        <button class="secondary" data-night-skip="watch">Keep watch without a target</button>
+        <button class="secondary" data-night-skip="watch">${canWatch ? "Save watch for later" : "Pass"}</button>
       </div>
     </section>
   `;
@@ -694,6 +790,7 @@ function toggleTransporterTarget(targetId) {
 // ##################################### 12
 // Socket listeners
 socket.on("state", (newState) => {
+  const previous = state;
   if (newState.phase !== state?.phase || newState.nightTurn?.key !== state?.nightTurn?.key) {
     privateView = false;
     pendingNightChoice = null;
@@ -701,9 +798,26 @@ socket.on("state", (newState) => {
     savingTurn = false;
   }
   state = newState;
-  $("host-code-input").value = "";
+  if (!previous) {
+    joinDetails = { code: state.roomCode, name: state.me.name, sessionId: playerId };
+    sessionStorage.setItem("vampireRoom", JSON.stringify({ code: state.roomCode, name: state.me.name }));
+    history.replaceState(null, "", roomLink());
+  }
+  gameClock.set(state.clock, state.serverTime);
   render();
+
+  if (previous?.me.alive && !state.me.alive) {
+    showTransition("You were eliminated", "✦", "elimination");
+  } else if (previous?.phase !== state.phase && state.phase === "day") {
+    showTransition(`Day ${state.dayNumber}`, "☀");
+  } else if (previous?.phase !== state.phase && state.phase === "night") {
+    showTransition(state.nightTurn?.playerId === state.me.id ? "Your turn" : `Night ${state.nightNumber}`, "☾");
+  } else if (previous?.nightTurn?.key !== state.nightTurn?.key && state.nightTurn?.playerId === state.me.id) {
+    showTransition("Your turn", "☾");
+  }
 });
+
+socket.on("roomLeft", returnToRooms);
 
 socket.on("disconnect", () => {
   if (!state?.me) return;
@@ -713,5 +827,8 @@ socket.on("disconnect", () => {
 });
 
 socket.on("errorMessage", (message) => {
-  showToast(message);
+  if (state && message.includes("room is closed")) return returnToRooms(message);
+  if (state) return showToast(message);
+  $("join-error").textContent = message;
+  $("join-error").classList.remove("hidden");
 });

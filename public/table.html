@@ -13,15 +13,23 @@
         <h1>Table announcer</h1>
         <span class="badge" id="table-connection" role="status">Connecting…</span>
       </div>
+      <form id="table-form" class="table-form">
+        <label>Room code
+          <input id="table-room-code" class="room-code-input" placeholder="6 characters" maxlength="6" pattern="[A-Za-z2-9]{6}" autocapitalize="characters" autocomplete="off" required />
+        </label>
+        <button class="secondary" type="submit">Connect to room</button>
+      </form>
+      <p id="table-error" class="form-error hidden" role="alert"></p>
       <p class="muted" id="table-phase">Lobby</p>
       <h2 id="table-turn" aria-live="polite">Waiting for the game</h2>
       <p id="table-progress"></p>
+      <div id="table-clock"></div>
       <div class="button-grid">
         <button id="table-audio" class="primary" type="button" disabled>Enable announcements</button>
         <button id="table-replay" class="secondary" type="button" disabled>Repeat last cue</button>
       </div>
       <p id="table-audio-status" class="muted" role="status">Turn up this device’s volume, then enable announcements.</p>
-      <a class="subtle-link" href="/">Back to player sign-in</a>
+      <a class="subtle-link" id="table-player-link" href="/">Go to player screen</a>
     </section>
     <section class="card">
       <h2>Recent cues</h2>
@@ -29,6 +37,7 @@
     </section>
   </main>
   <script src="/socket.io/socket.io.js"></script>
+  <script src="/clock.js"></script>
   <script src="/table.js"></script>
 </body>
 </html>
