@@ -10,6 +10,10 @@ Vampire is a real-time social deduction game. Create a room, then share its six-
 
 The room creator hosts automatically. To use the table announcer, open the room’s tablet link or enter the same code at `/table`.
 
+## Practice with bots
+
+Check **Practice room** when creating a room. Use **Add bot** for individual seats or **Set up all 8 roles** to deal one of each role and fill the empty seats. **Open window** gives the host that bot’s player screen in a separate window. Bots play automatically when their windows are closed. An open bot window starts in manual control and has an **Auto-play** switch for observing.
+
 ## Run locally
 
 Install Node.js 24 and run `npm ci --omit=dev --ignore-scripts`, then `npm run setup-voice` and `npm start`. Open `http://localhost:3000` to play.

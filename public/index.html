@@ -32,11 +32,22 @@
             Room code
             <input id="room-code-input" class="room-code-input" type="text" placeholder="6 characters" pattern="[A-Za-z2-9]{6}" maxlength="6" autocomplete="off" autocapitalize="characters" spellcheck="false" />
           </label>
+          <label id="practice-option" class="practice-option">
+            <input id="practice-input" type="checkbox" />
+            <span><strong>Practice room</strong><small>Add bots and play from their screens.</small></span>
+          </label>
           <button id="join-submit" class="primary" type="submit">Create room</button>
           <p id="join-error" class="form-error hidden" role="alert"></p>
         </form>
         <a class="subtle-link" href="/table">Open table announcer</a>
       </div>
+    </section>
+  </main>
+
+  <main id="bot-entry" class="screen hidden">
+    <section class="card">
+      <h1>Bot player view</h1>
+      <p id="bot-entry-message" role="status">Connecting to your practice room…</p>
     </section>
   </main>
 

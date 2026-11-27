@@ -9,12 +9,21 @@ let privateView = false;
 let pendingNightChoice = null;
 let savingTurn = false;
 let roomMode = "create";
+let botDeskOpen = true;
+const botWindows = new Map();
 
 const invitedRoom = new URLSearchParams(location.search).get("room")?.toUpperCase() || "";
+const botToken = new URLSearchParams(location.hash.slice(1)).get("bot");
+const isBotWindow = botToken !== null;
+let connectBot = isBotWindow;
+const playerId = isBotWindow ? null : getPlayerId();
 
-const storedId = localStorage.getItem("vampirePlayerId");
-const playerId = /^[A-Za-z0-9_-]{22,80}$/.test(storedId || "") ? storedId : makePlayerId();
-localStorage.setItem("vampirePlayerId", playerId);
+function getPlayerId() {
+  const storedId = localStorage.getItem("vampirePlayerId");
+  const id = /^[A-Za-z0-9_-]{22,80}$/.test(storedId || "") ? storedId : makePlayerId();
+  localStorage.setItem("vampirePlayerId", id);
+  return id;
+}
 
 function makePlayerId() {
   if (window.crypto && typeof window.crypto.randomUUID === "function") {
@@ -87,6 +96,7 @@ function setRoomMode(mode) {
   $("room-code-field").classList.toggle("hidden", !joining);
   $("room-code-input").required = joining;
   $("room-code-input").disabled = !joining;
+  $("practice-option").classList.toggle("hidden", joining);
   $("join-submit").textContent = joining ? "Join room" : "Create room";
   $("join-error").classList.add("hidden");
 }
@@ -96,14 +106,22 @@ $("mode-join").addEventListener("click", () => setRoomMode("join"));
 if (invitedRoom) $("room-code-input").value = invitedRoom.slice(0, 6);
 setRoomMode(invitedRoom ? "join" : "create");
 
-try {
-  const previousRoom = JSON.parse(sessionStorage.getItem("vampireRoom"));
-  if (previousRoom?.code === invitedRoom && typeof previousRoom.name === "string") {
-    $("name-input").value = previousRoom.name;
-    joinDetails = { ...previousRoom, sessionId: playerId };
+if (isBotWindow) {
+  $("join-screen").classList.add("hidden");
+  $("bot-entry").classList.remove("hidden");
+  $("share-room-btn").classList.add("hidden");
+  $("leave-room-btn").textContent = "Release bot";
+  document.title = "Bot player view | Vampire";
+} else {
+  try {
+    const previousRoom = JSON.parse(sessionStorage.getItem("vampireRoom"));
+    if (previousRoom?.code === invitedRoom && typeof previousRoom.name === "string") {
+      $("name-input").value = previousRoom.name;
+      joinDetails = { ...previousRoom, sessionId: playerId };
+    }
+  } catch {
+    // A fresh form is still available when browser storage is unavailable.
   }
-} catch {
-  // A fresh form is still available when browser storage is unavailable.
 }
 
 $("join-form").addEventListener("submit", (event) => {
@@ -113,6 +131,7 @@ $("join-form").addEventListener("submit", (event) => {
     sessionId: playerId,
     name: $("name-input").value.trim(),
     code: roomMode === "join" ? $("room-code-input").value.trim().toUpperCase() : "",
+    practice: roomMode === "create" && $("practice-input").checked,
   };
   if (!joinDetails.name) {
     $("name-input").focus();
@@ -122,13 +141,37 @@ $("join-form").addEventListener("submit", (event) => {
 });
 
 socket.on("connect", () => {
-  if (joinDetails?.code) socket.emit("join", joinDetails);
+  if (connectBot) socket.emit("joinBot", { code: invitedRoom, token: botToken });
+  else if (joinDetails?.code) socket.emit("join", joinDetails);
 });
 
 function roomLink(path = "/") {
   const url = new URL(path, location.origin);
   url.searchParams.set("room", state.roomCode);
   return url.href;
+}
+
+function botLink(bot) {
+  const url = new URL(roomLink());
+  url.hash = new URLSearchParams({ bot: bot.token }).toString();
+  return url.href;
+}
+
+function openBotWindow(event) {
+  if (event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
+  event.preventDefault();
+  const { href, dataset: { botId } } = event.currentTarget;
+  const previous = botWindows.get(botId);
+  if (previous?.href === href && !previous.popup.closed) {
+    if (!state.bots.find((bot) => bot.id === botId)?.windowOpen) previous.popup.location.reload();
+    previous.popup.focus();
+    return;
+  }
+
+  const popup = window.open(href, `vampire-bot-${botId}`, "popup,width=460,height=760");
+  if (!popup) return showToast("Allow pop-ups or open this bot link in a new tab.");
+  popup.opener = null;
+  botWindows.set(botId, { href, popup });
 }
 
 async function copyInvite() {
@@ -145,6 +188,19 @@ $("share-room-btn").addEventListener("click", copyInvite);
 $("leave-room-btn").addEventListener("click", () => socket.emit("leaveRoom"));
 
 function returnToRooms(message) {
+  if (isBotWindow) {
+    connectBot = false;
+    state = null;
+    gameClock.set(null);
+    document.body.removeAttribute("data-phase");
+    $("game-screen").classList.add("hidden");
+    $("night-panel").classList.add("hidden");
+    $("phase-transition").classList.add("hidden");
+    $("bot-entry").classList.remove("hidden");
+    $("bot-entry-message").textContent = message || "Bot released. You can close this window or reopen it from the practice room.";
+    return;
+  }
+
   state = null;
   joinDetails = null;
   gameClock.set(null);
@@ -158,6 +214,9 @@ function returnToRooms(message) {
   $("phase-transition").classList.add("hidden");
   $("join-screen").classList.remove("hidden");
   $("room-code-input").value = "";
+  $("bot-desk")?.remove();
+  botWindows.clear();
+  botDeskOpen = true;
   setRoomMode("create");
   if (message) showToast(message);
 }
@@ -188,7 +247,10 @@ document.addEventListener("visibilitychange", () => {
 function render() {
   if (!state || !state.me) return;
 
+  const existingDesk = $("bot-desk");
+  if (existingDesk) botDeskOpen = existingDesk.open;
   $("join-screen").classList.add("hidden");
+  $("bot-entry").classList.add("hidden");
   document.body.dataset.phase = state.phase;
   $("room-label").textContent = `Room ${state.roomCode}`;
   const atNight = state.phase === "night";
@@ -206,8 +268,10 @@ function render() {
 
   $("top-player-list").innerHTML = renderPlayerList();
   $("app").innerHTML = `
+    ${renderBotControls()}
     ${renderStatusCard()}
     ${renderRoleCard()}
+    ${renderBotDesk()}
     ${renderHostControls()}
     ${renderActionCard()}
     ${renderMessagesCard()}
@@ -236,10 +300,12 @@ function renderNightScreen() {
       <h1>${isOpen ? "Your private turn" : heading}</h1>
       ${isOpen ? `<button id="hide-private-btn" class="secondary">Cover screen</button>`
         : `<p>${yourTurn ? "Open your turn to make a choice." : active ? `${escapeHtml(active.name)}${active.connected ? " is taking their turn." : " is reconnecting."}` : "The night is ending."}</p>
-          ${yourTurn && !savingTurn ? `<button id="show-private-btn" class="primary">Open my turn</button>` : ""}`}
+          ${yourTurn && !savingTurn ? `<button id="show-private-btn" class="primary">${state.me.botAuto ? "View private turn" : "Open my turn"}</button>` : ""}`}
       ${gameClock.markup("Turn ends in")}
     </section>
-    ${isOpen ? `${renderRoleCard()}${pendingNightChoice ? renderNightConfirmation() : renderNightActions()}` : ""}
+    ${renderBotControls()}
+    ${isOpen ? `${renderRoleCard()}${state.me.botAuto ? "" : pendingNightChoice ? renderNightConfirmation() : renderNightActions()}` : ""}
+    ${renderBotDesk()}
     ${!isOpen && state.me.isHost ? `
       <details class="card night-host">
         <summary>Host controls</summary>
@@ -284,6 +350,7 @@ function renderPlayerList() {
 
       const tags = [];
       if (player.isHost) tags.push("HOST");
+      if (player.isBot) tags.push("BOT");
       if (!player.connected) tags.push("OFFLINE");
       if (state.phase === "gameover" && player.role) tags.push(player.role);
 
@@ -314,7 +381,7 @@ function renderStatusCard() {
       </div>
       <p class="muted">Alive players: ${state.aliveCount}</p>
       ${state.phase === "day" ? `<p>${state.votesCast} of ${state.aliveCount} votes in</p>${gameClock.markup("Voting ends in")}` : ""}
-      ${state.phase === "lobby" ? `<p>Share the room code or invite link. Night turns last ${Math.ceil(state.timing.night / 1000)} seconds. A turn passes when time runs out.</p>` : ""}
+      ${state.phase === "lobby" ? `<p>${state.practice ? "Practice room. The host can open the bot players’ views." : "Share the room code or invite link."} Night turns last ${Math.ceil(state.timing.night / 1000)} seconds.</p>` : ""}
       ${state.phase === "gameover" ? renderGameOverSummary() : ""}
     </section>
   `;
@@ -373,6 +440,44 @@ function renderMessagesCard() {
       </div>
     </section>
   `;
+}
+
+function renderBotControls() {
+  if (!state.me.isBot) return "";
+  return `
+    <section class="card bot-controls" aria-label="Bot player controls">
+      <div>
+        <h2>${escapeHtml(state.me.name)}</h2>
+        <p class="muted">${state.me.botAuto ? "Playing automatically" : "You control this bot"} · Practice room</p>
+      </div>
+      <button type="button" id="toggle-bot-auto" class="secondary">${state.me.botAuto ? "Take control" : "Auto-play"}</button>
+    </section>`;
+}
+
+function renderBotDesk() {
+  if (!state.bots) return "";
+  const inLobby = state.phase === "lobby";
+  return `
+    <details id="bot-desk" class="card bot-desk" ${botDeskOpen ? "open" : ""}>
+      <summary>Practice bots <span class="badge">${state.bots.length}</span></summary>
+      ${inLobby ? `
+        <p>Open a bot window to play its turns. Bots with no open window play automatically.</p>
+        <div class="bot-actions">
+          <button type="button" id="add-bot-btn" class="primary">Add bot</button>
+          <button type="button" id="all-roles-btn" class="secondary">Set up all 8 roles</button>
+        </div>` : ""}
+      ${state.bots.length ? `<ul class="bot-list">
+        ${state.bots.map((bot) => `
+          <li>
+            <div>
+              <strong>${escapeHtml(bot.name)}${bot.role ? ` · ${escapeHtml(bot.role)}` : ""}</strong>
+              <small>${bot.automatic ? "Automatic" : "Manual"}${bot.windowOpen ? " · Window open" : ""}</small>
+            </div>
+            <a class="bot-open" href="${escapeHtml(botLink(bot))}" data-bot-id="${escapeHtml(bot.id)}" target="_blank" rel="noopener" aria-label="Open ${escapeHtml(bot.name)} window">Open window</a>
+            ${inLobby ? `<button type="button" class="bot-remove" data-remove-bot="${escapeHtml(bot.id)}" aria-label="Remove ${escapeHtml(bot.name)}">Remove</button>` : ""}
+          </li>`).join("")}
+      </ul>` : ""}
+    </details>`;
 }
 
 // ##################################### 7
@@ -450,7 +555,7 @@ function renderActionCard() {
     `;
   }
 
-  if (state.phase === "day") return renderDayVoting();
+  if (state.phase === "day" && !state.me.botAuto) return renderDayVoting();
 
   return "";
 }
@@ -598,7 +703,7 @@ function targetButtons(players, mode, actionName, disabledPlayerId = null) {
 }
 
 function renderMayorRevealButton() {
-  if (state.phase !== "day") return "";
+  if (state.phase !== "day" || state.me.botAuto) return "";
   if (state.me.role !== "Mayor" || !state.me.alive || state.me.mayorRevealed || !state.hasStarted || state.phase === "gameover") {
     return "";
   }
@@ -657,6 +762,13 @@ function renderRoleDescriptions() {
 // ##################################### 10
 // Dynamic event binding after render
 function bindDynamicButtons() {
+  $("add-bot-btn")?.addEventListener("click", () => socket.emit("addBot"));
+  $("all-roles-btn")?.addEventListener("click", () => socket.emit("setUpAllRoles"));
+  $("toggle-bot-auto")?.addEventListener("click", () => socket.emit("setBotAuto", !state.me.botAuto));
+  document.querySelectorAll("[data-bot-id]").forEach((link) => link.addEventListener("click", openBotWindow));
+  document.querySelectorAll("[data-remove-bot]").forEach((button) => {
+    button.addEventListener("click", () => socket.emit("removeBot", button.dataset.removeBot));
+  });
   $("show-private-btn")?.addEventListener("click", () => {
     privateView = true;
     render();
@@ -768,7 +880,7 @@ function submitNightChoice() {
   savingTurn = true;
   hidePrivateView();
   socket.timeout(6500).emit("nightAction", { ...action, turnKey }, (error, message) => {
-    if (state.nightTurn?.key !== turnKey || (!error && !message)) return;
+    if (state?.nightTurn?.key !== turnKey || (!error && !message)) return;
     savingTurn = false;
     render();
     showToast(message || "Could not confirm your choice. Check whose turn it is and try again.");
@@ -791,7 +903,8 @@ function toggleTransporterTarget(targetId) {
 // Socket listeners
 socket.on("state", (newState) => {
   const previous = state;
-  if (newState.phase !== state?.phase || newState.nightTurn?.key !== state?.nightTurn?.key) {
+  if (newState.phase !== previous?.phase || newState.nightTurn?.key !== previous?.nightTurn?.key
+    || newState.me.botAuto !== previous?.me.botAuto) {
     privateView = false;
     pendingNightChoice = null;
     selectedTransporterTargets = [];
@@ -799,9 +912,13 @@ socket.on("state", (newState) => {
   }
   state = newState;
   if (!previous) {
-    joinDetails = { code: state.roomCode, name: state.me.name, sessionId: playerId };
-    sessionStorage.setItem("vampireRoom", JSON.stringify({ code: state.roomCode, name: state.me.name }));
-    history.replaceState(null, "", roomLink());
+    if (isBotWindow) {
+      document.title = `${state.me.name} | Vampire practice`;
+    } else {
+      joinDetails = { code: state.roomCode, name: state.me.name, sessionId: playerId };
+      sessionStorage.setItem("vampireRoom", JSON.stringify({ code: state.roomCode, name: state.me.name }));
+      history.replaceState(null, "", roomLink());
+    }
   }
   gameClock.set(state.clock, state.serverTime);
   render();

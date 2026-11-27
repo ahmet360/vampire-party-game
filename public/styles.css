@@ -565,6 +565,57 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .entry-form .primary:hover { background: #702235; }
 .entry-form .subtle-link { margin-top: 19px; color: #682237; text-underline-offset: 3px; }
 
+.practice-option {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 12px;
+  border: 1px solid #d2bfc2;
+  border-radius: 10px;
+  cursor: pointer;
+}
+
+.practice-option:has(:checked) { background: #f8e6e7; border-color: #a15a6a; }
+.practice-option input { flex-shrink: 0; width: 17px; height: 17px; margin: 0; accent-color: #892b40; cursor: pointer; }
+.practice-option small { display: block; margin-top: 2px; color: #655260; font-weight: 400; }
+
+.bot-desk, .bot-controls {
+  border-color: #6d5367;
+  background: linear-gradient(130deg, #302436, #1b1a27 85%);
+}
+
+.bot-desk summary { color: #f4d5ad; font-weight: 680; cursor: pointer; }
+.bot-desk summary .badge { margin-left: 7px; }
+.bot-desk p { margin: 12px 0; }
+.bot-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.bot-list { list-style: none; margin: 14px 0 0; padding: 0; }
+.bot-list li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 12px;
+  padding: 10px 0;
+  border-top: 1px solid #574455;
+}
+.bot-list li:last-child { padding-bottom: 0; }
+.bot-list li > div { flex: 1 0 10rem; }
+.bot-list small { display: block; margin-top: 2px; color: var(--muted); }
+.bot-open {
+  display: inline-flex;
+  align-items: center;
+  min-height: 42px;
+  padding: 6px 10px;
+  color: #f4d5ad;
+  border: 1px solid #84667b;
+  border-radius: 9px;
+  text-underline-offset: 3px;
+}
+.bot-open:hover { background: #483448; }
+.bot-remove { min-height: 42px; padding: 6px 10px; border-radius: 9px; }
+.bot-controls { display: flex; align-items: center; flex-wrap: wrap; justify-content: space-between; gap: 8px 12px; }
+.bot-controls h2 { margin-bottom: 2px; }
+.bot-controls p, #bot-entry-message { margin-bottom: 0; }
+
 .room-mode {
   display: grid;
   grid-template-columns: 1fr 1fr;

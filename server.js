@@ -34,6 +34,7 @@ const voiceCache = new WeakMap();
 const playerEvents = [
   "updateConfig", "startGame", "resetGame", "endGame", "forceSleep", "resolveNight",
   "skipNightTurn", "nightAction", "revealMayor", "vote", "resolveVotes",
+  "addBot", "removeBot", "setUpAllRoles", "setBotAuto",
 ];
 
 app.disable("x-powered-by");
@@ -107,7 +108,7 @@ io.on("connection", (socket) => {
       return socket.emit("errorMessage", "Room creation is busy. Give it a moment and try again.");
     }
     const code = newRoomCode();
-    const room = createRoom(io, code, payload.sessionId, timing);
+    const room = createRoom(io, code, payload.sessionId, timing, payload.practice === true);
     rooms.set(code, room);
     room.join(socket, payload.sessionId, payload.name);
   });
@@ -118,6 +119,14 @@ io.on("connection", (socket) => {
     if (!room) return socket.emit("errorMessage", "That room is closed or the code is incorrect.");
     const error = room.join(socket, payload.sessionId, payload.name);
     if (error) socket.emit("errorMessage", error);
+  });
+
+  socket.on("joinBot", (payload) => {
+    if (socket.data.gameCode) return;
+    const room = rooms.get(roomCode(payload?.code));
+    if (!room?.joinBot(socket, payload?.token)) {
+      socket.emit("roomLeft", "This bot window has expired. Reopen its view from the practice room.");
+    }
   });
 
   socket.on("leaveRoom", () => {

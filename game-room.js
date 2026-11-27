@@ -31,6 +31,7 @@ const NIGHT_ACTIONS = {
 };
 
 const audioTestCue = { id: 0, text: "Announcements are on." };
+const MAX_PLAYERS = 24;
 
 function makeDefaultRoleConfig() {
   const config = {};
@@ -45,7 +46,7 @@ function makeDefaultRoleConfig() {
   return config;
 }
 
-function createRoom(io, code, hostSession, timing) {
+function createRoom(io, code, hostSession, timing, practice = false) {
   const players = new Map();
   const socketToPlayerId = new Map();
   const tableSession = randomUUID();
@@ -53,6 +54,9 @@ function createRoom(io, code, hostSession, timing) {
   let cueSequence = 0;
   let phaseTimer;
   let hostTimer;
+  let botTimer;
+  let botClock;
+  let nextBotNumber = 1;
   let emptySince = Date.now();
 
   const game = {
@@ -200,6 +204,10 @@ function createRoom(io, code, hostSession, timing) {
     return Boolean(playerId && getPlayer(playerId)?.isHost);
   }
 
+  function isAutomaticBot(player) {
+    return Boolean(player?.isBot && (player.botAuto || !player.socketId));
+  }
+
   function sendError(socket, message) {
     socket.emit("errorMessage", message);
   }
@@ -214,6 +222,7 @@ function createRoom(io, code, hostSession, timing) {
       serverTime: Date.now(),
       clock: game.clock,
       timing,
+      practice,
       phase: game.phase,
       hasStarted: game.hasStarted,
       dayNumber: game.dayNumber,
@@ -235,9 +244,20 @@ function createRoom(io, code, hostSession, timing) {
         connected: player.connected,
         alive: player.alive,
         isHost: player.isHost,
+        isBot: Boolean(player.isBot),
         mayorRevealed: player.mayorRevealed,
         role: game.phase === "gameover" ? player.role : null,
       })),
+      ...(practice && me?.isHost ? {
+        bots: getAllPlayers().filter((player) => player.isBot).map((bot) => ({
+          id: bot.id,
+          name: bot.name,
+          role: bot.role,
+          token: bot.botToken,
+          automatic: isAutomaticBot(bot),
+          windowOpen: Boolean(bot.socketId),
+        })),
+      } : {}),
       me: me
         ? {
             id: me.id,
@@ -245,10 +265,12 @@ function createRoom(io, code, hostSession, timing) {
             connected: me.connected,
             alive: me.alive,
             isHost: me.isHost,
+            isBot: Boolean(me.isBot),
+            botAuto: Boolean(me.botAuto),
             role: me.role,
             mayorRevealed: me.mayorRevealed,
             hunterUsed: me.hunterUsed,
-        villagerWatchUsed: me.villagerWatchUsed,
+            villagerWatchUsed: me.villagerWatchUsed,
             privateMessages: me.privateMessages.slice(-10),
             nightTurnComplete: turnIndex >= 0 && turnIndex < game.nightTurnIndex,
             dayVoteTarget: game.dayVotes[me.id] || null,
@@ -264,31 +286,41 @@ function createRoom(io, code, hostSession, timing) {
       io.to(player.socketId).emit("state", buildStateFor(player.id));
     }
     io.to(tableRoom).emit("tableState", buildTableState());
+    if (practice) scheduleBotActions();
+  }
+
+  function detachPlayerSocket(player, message) {
+    if (!player.socketId) return;
+    socketToPlayerId.delete(player.socketId);
+    const previousSocket = io.sockets.sockets.get(player.socketId);
+    player.socketId = null;
+    if (!previousSocket) return;
+    previousSocket.data.gameCode = null;
+    previousSocket.emit("roomLeft", message);
+  }
+
+  function attachPlayerSocket(player, socket) {
+    if (player.socketId !== socket.id) {
+      detachPlayerSocket(player, "This player rejoined on another tab.");
+    }
+    player.socketId = socket.id;
+    players.set(player.id, player);
+    socketToPlayerId.set(socket.id, player.id);
+    socket.data.gameCode = code;
   }
 
   function join(socket, sessionId, name) {
     const existing = getAllPlayers().find((player) => player.sessionId === sessionId);
-    if (!existing && players.size >= 24) return "This room is full.";
+    if (!existing && players.size >= MAX_PLAYERS) return "This room is full.";
 
     const player = existing || {
       id: randomUUID(), sessionId, alive: game.phase === "lobby", role: null,
       mayorRevealed: false, hunterUsed: false, villagerWatchUsed: false, privateMessages: [],
     };
-    if (existing?.socketId && existing.socketId !== socket.id) {
-      socketToPlayerId.delete(existing.socketId);
-      const previousSocket = io.sockets.sockets.get(existing.socketId);
-      if (previousSocket) {
-        previousSocket.data.gameCode = null;
-        previousSocket.emit("roomLeft", "This player rejoined on another tab.");
-      }
-    }
     player.name = cleanName(name);
-    player.socketId = socket.id;
     player.connected = true;
     player.isHost = sessionId === hostSession;
-    players.set(player.id, player);
-    socketToPlayerId.set(socket.id, player.id);
-    socket.data.gameCode = code;
+    attachPlayerSocket(player, socket);
     emptySince = null;
 
     if (!existing && !player.alive) pushPrivateMessage(player.id, "You're watching this round. You'll play in the next one.");
@@ -302,13 +334,40 @@ function createRoom(io, code, hostSession, timing) {
     emitAll();
   }
 
+  function joinBot(socket, token) {
+    if (!practice || typeof token !== "string" || token.length !== 36 || emptySince !== null) return false;
+    const bot = getAllPlayers().find((player) => player.botToken === token);
+    if (!bot) return false;
+    attachPlayerSocket(bot, socket);
+    emitAll();
+    return true;
+  }
+
+  function addPracticeBot() {
+    const bot = {
+      id: randomUUID(), name: `Bot ${nextBotNumber++}`, botToken: randomUUID(), isBot: true,
+      connected: true, alive: true, isHost: false, role: null,
+      mayorRevealed: false, hunterUsed: false, villagerWatchUsed: false, privateMessages: [],
+    };
+    players.set(bot.id, bot);
+  }
+
+  function rotateBotAccess() {
+    for (const bot of players.values()) {
+      if (!bot.isBot) continue;
+      detachPlayerSocket(bot, "Bot access changed. Reopen this view from the current host’s practice room.");
+      bot.botToken = randomUUID();
+    }
+  }
+
   function transferHosting() {
     const candidates = getAllPlayers();
     if (candidates.some((candidate) => candidate.isHost && candidate.connected)) return;
-    const successor = candidates.find((candidate) => candidate.connected);
+    const successor = candidates.find((candidate) => candidate.connected && !candidate.isBot);
     if (!successor) return;
     for (const candidate of candidates) candidate.isHost = candidate === successor;
     hostSession = successor.sessionId;
+    if (practice) rotateBotAccess();
     pushMessage(`${successor.name} is now the host.`);
   }
 
@@ -328,14 +387,78 @@ function createRoom(io, code, hostSession, timing) {
     socketToPlayerId.delete(socket.id);
     if (!player) return;
 
-    player.connected = false;
     player.socketId = null;
+    if (player.isBot) {
+      emitAll();
+      return;
+    }
+
+    player.connected = false;
     if (game.phase === "lobby") players.delete(playerId);
-    const hasPlayers = getAllPlayers().some((candidate) => candidate.connected);
-    if (!hasPlayers) emptySince = Date.now();
+    const hasPlayers = getAllPlayers().some((candidate) => candidate.connected && !candidate.isBot);
+    if (!hasPlayers) {
+      emptySince = Date.now();
+      if (practice && transferHost) rotateBotAccess();
+    }
     else if (player.isHost && transferHost) transferHosting();
     else if (player.isHost) scheduleHostTransfer();
     emitAll();
+  }
+
+  function nextBotNightChoice(bot) {
+    const alive = getAlivePlayers();
+    const others = alive.filter((player) => player !== bot);
+    switch (bot.role) {
+      case "Transporter":
+        return alive.length >= 2 ? { targetIds: shuffle(alive).slice(0, 2).map((player) => player.id) } : { skip: true };
+      case "Doctor":
+        return chooseTarget(alive.filter((player) => player.id !== game.doctorLastSave[bot.id]));
+      case "Hunter":
+        return !bot.hunterUsed && randomInt(3) === 0 ? chooseTarget(others) : { skip: true };
+      case "Villager":
+        return bot.villagerWatchUsed ? { skip: true } : chooseTarget(others);
+      case "Vampire":
+      case "Detective":
+        return chooseTarget(others);
+      default:
+        return { skip: true };
+    }
+  }
+
+  function chooseTarget(candidates) {
+    if (!candidates.length) return { skip: true };
+    return { targetId: candidates[randomInt(candidates.length)].id };
+  }
+
+  function scheduleBotActions() {
+    const turn = getNightTurn();
+    const botsDue = turn ? isAutomaticBot(getPlayer(turn.playerId))
+      : game.phase === "day" && getAlivePlayers().some((bot) => isAutomaticBot(bot) && !game.dayVotes[bot.id]);
+    const clock = botsDue && emptySince === null ? game.clock : null;
+    if (clock === botClock) return;
+
+    clearTimeout(botTimer);
+    botClock = clock;
+    if (!clock) return;
+
+    const delay = Math.min(turn ? 3200 : 5500, Math.floor((clock.deadline - Date.now()) / 2));
+    botTimer = setTimeout(() => {
+      botClock = null;
+      if (game.clock !== clock || clock.deadline <= Date.now()) return;
+      if (turn) {
+        const bot = getPlayer(turn.playerId);
+        if (!isAutomaticBot(bot)) return;
+        submitNightAction(bot, { ...nextBotNightChoice(bot), turnKey: turn.key });
+      } else {
+        for (const bot of getAlivePlayers()) {
+          if (!isAutomaticBot(bot) || game.dayVotes[bot.id]) continue;
+          if (game.phase !== "day") break;
+          revealMayor(bot);
+          submitVote(bot, chooseTarget(getAlivePlayers().filter((player) => player !== bot)).targetId);
+        }
+      }
+      emitAll();
+    }, Math.max(50, delay));
   }
 
   function stopClock() {
@@ -754,7 +877,89 @@ function createRoom(io, code, hostSession, timing) {
     startNight();
   }
 
+  function submitNightAction(player, payload) {
+    const turn = getNightTurn();
+    if (!player?.alive || !turn || turn.playerId !== player.id || turn.key !== payload?.turnKey || Date.now() >= game.clock?.deadline) {
+      return "This turn is no longer available. Check the current turn on your screen.";
+    }
+
+    const { role, id: playerId } = player;
+    const { targetId, targetIds } = payload;
+    const skip = payload.skip === true;
+    const group = player.hunterUsed && role === "Hunter" ? null : NIGHT_ACTIONS[role];
+    if (role === "Vampire" && skip && !game.vampireCanSkip) return "The host has disabled skipping for Vampires.";
+
+    if (role === "Transporter") {
+      const pair = Array.isArray(targetIds) ? targetIds : [];
+      if (!skip && (pair.length !== 2 || pair[0] === pair[1] || !pair.every(isAlive))) {
+        return "Choose two different living players.";
+      }
+      game.nightActions[group][playerId] = { skip, targetIds: skip ? [] : pair };
+    } else {
+      if (!skip && (!isAlive(targetId) || (targetId === playerId && role !== "Doctor"))) {
+        return "Choose an available player.";
+      }
+      if (role === "Doctor" && !skip && game.doctorLastSave[playerId] === targetId) {
+        return "You cannot save the same player two nights in a row.";
+      }
+      if (group) game.nightActions[group][playerId] = { skip, targetId: skip ? null : targetId };
+      else if (!skip && role === "Villager" && !player.villagerWatchUsed) {
+        player.villagerWatchUsed = true;
+        game.nightActions.watches[playerId] = targetId;
+      }
+    }
+
+    advanceNightTurn();
+    return null;
+  }
+
+  function revealMayor(player) {
+    if (!player?.alive || player.role !== "Mayor" || player.mayorRevealed || game.phase !== "day") return false;
+    player.mayorRevealed = true;
+    pushMessage(`${player.name} has revealed as the Mayor! Their vote now counts as 2.`);
+    return true;
+  }
+
+  function submitVote(voter, targetId) {
+    if (!voter?.alive || game.phase !== "day" || Date.now() >= game.clock?.deadline) return false;
+    if (!isAlive(targetId) || targetId === voter.id) return false;
+
+    game.dayVotes[voter.id] = targetId;
+    if (allDayVotesSubmitted()) resolveVotes();
+    return true;
+  }
+
   const handlers = {
+    addBot(socket) {
+      if (!practice || !isHostSocket(socket) || game.phase !== "lobby") return;
+      if (players.size >= MAX_PLAYERS) return sendError(socket, "This room is full.");
+      addPracticeBot();
+      emitAll();
+    },
+
+    removeBot(socket, id) {
+      if (!practice || !isHostSocket(socket) || game.phase !== "lobby") return;
+      const bot = getPlayer(id);
+      if (!bot?.isBot) return;
+      detachPlayerSocket(bot, "This bot was removed. Reopen a bot view from the practice room.");
+      players.delete(id);
+      emitAll();
+    },
+
+    setUpAllRoles(socket) {
+      if (!practice || !isHostSocket(socket) || game.phase !== "lobby") return;
+      for (const role of ROLE_ORDER) game.roleConfig[role] = { enabled: true, count: 1 };
+      while (players.size < ROLE_ORDER.length) addPracticeBot();
+      emitAll();
+    },
+
+    setBotAuto(socket, automatic) {
+      const bot = getPlayer(socketToPlayerId.get(socket.id));
+      if (!bot?.isBot || typeof automatic !== "boolean") return;
+      bot.botAuto = automatic;
+      emitAll();
+    },
+
     updateConfig(socket, payload) {
       if (!isHostSocket(socket)) return;
       if (game.phase !== "lobby") return;
@@ -814,70 +1019,20 @@ function createRoom(io, code, hostSession, timing) {
     },
 
     nightAction(socket, payload, acknowledge) {
-      const playerId = socketToPlayerId.get(socket.id);
-      const player = getPlayer(playerId);
-      const turn = getNightTurn();
-      const report = typeof acknowledge === "function" ? acknowledge : () => {};
-      if (!player?.alive || !turn || turn.playerId !== playerId || turn.key !== payload?.turnKey || Date.now() >= game.clock?.deadline) {
-        return report("This turn is no longer available. Check the current turn on your screen.");
-      }
-
-      const { role } = player;
-      const { targetId, targetIds } = payload;
-      const skip = payload.skip === true;
-      const group = player.hunterUsed && role === "Hunter" ? null : NIGHT_ACTIONS[role];
-      if (role === "Vampire" && skip && !game.vampireCanSkip) return report("The host has disabled skipping for Vampires.");
-
-      if (role === "Transporter") {
-        const pair = Array.isArray(targetIds) ? targetIds : [];
-        if (!skip && (pair.length !== 2 || pair[0] === pair[1] || !pair.every(isAlive))) {
-          return report("Choose two different living players.");
-        }
-        game.nightActions[group][playerId] = { skip, targetIds: skip ? [] : pair };
-      } else {
-        if (!skip && (!isAlive(targetId) || (targetId === playerId && role !== "Doctor"))) {
-          return report("Choose an available player.");
-        }
-        if (role === "Doctor" && !skip && game.doctorLastSave[playerId] === targetId) {
-          return report("You cannot save the same player two nights in a row.");
-        }
-        if (group) game.nightActions[group][playerId] = { skip, targetId: skip ? null : targetId };
-        else if (!skip && role === "Villager" && !player.villagerWatchUsed) {
-          player.villagerWatchUsed = true;
-          game.nightActions.watches[playerId] = targetId;
-        }
-      }
-
-      advanceNightTurn();
-      emitAll();
-      report(null);
+      const player = getPlayer(socketToPlayerId.get(socket.id));
+      const error = isAutomaticBot(player) ? "Take control before choosing an action." : submitNightAction(player, payload);
+      if (!error) emitAll();
+      if (typeof acknowledge === "function") acknowledge(error);
     },
 
     revealMayor(socket) {
-      const playerId = socketToPlayerId.get(socket.id);
-      const player = getPlayer(playerId);
-      if (!player?.alive || player.role !== "Mayor" || player.mayorRevealed) return;
-      if (game.phase !== "day") return;
-
-      player.mayorRevealed = true;
-      pushMessage(`${player.name} has revealed as the Mayor! Their vote now counts as 2.`);
-      emitAll();
+      const player = getPlayer(socketToPlayerId.get(socket.id));
+      if (!isAutomaticBot(player) && revealMayor(player)) emitAll();
     },
 
     vote(socket, payload) {
-      const voterId = socketToPlayerId.get(socket.id);
-      const voter = getPlayer(voterId);
-      if (!voter?.alive || game.phase !== "day" || Date.now() >= game.clock?.deadline) return;
-      const targetId = payload?.targetId;
-      if (!isAlive(targetId) || targetId === voterId) return;
-
-      game.dayVotes[voterId] = targetId;
-
-      if (allDayVotesSubmitted()) {
-        resolveVotes();
-      }
-
-      emitAll();
+      const voter = getPlayer(socketToPlayerId.get(socket.id));
+      if (!isAutomaticBot(voter) && submitVote(voter, payload?.targetId)) emitAll();
     },
 
     resolveVotes(socket) {
@@ -889,7 +1044,7 @@ function createRoom(io, code, hostSession, timing) {
   };
 
   return {
-    handlers, join, leave, tableRoom, buildTableState,
+    handlers, join, joinBot, leave, tableRoom, buildTableState,
     cue(session, id) {
       if (session === tableSession) return id === 0 ? audioTestCue : game.tableCues.find((entry) => entry.id === id);
     },
@@ -897,6 +1052,12 @@ function createRoom(io, code, hostSession, timing) {
     dispose() {
       stopClock();
       clearTimeout(hostTimer);
+      clearTimeout(botTimer);
+      if (practice) {
+        for (const bot of players.values()) {
+          if (bot.isBot) detachPlayerSocket(bot, "This practice room has closed.");
+        }
+      }
     },
   };
 }
