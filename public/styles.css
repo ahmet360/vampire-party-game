@@ -601,6 +601,8 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .bot-list li:last-child { padding-bottom: 0; }
 .bot-list li > div { flex: 1 0 10rem; }
 .bot-list small { display: block; margin-top: 2px; color: var(--muted); }
+.bot-desk.tiled .bot-list { max-height: 122px; overflow-y: auto; scrollbar-width: thin; }
+.bot-desk.tiled li > div { flex-basis: 8rem; }
 .bot-open {
   display: inline-flex;
   align-items: center;
@@ -665,7 +667,16 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
     grid-template-columns: clamp(275px, 22vw, 355px) minmax(0, 1fr);
     height: 100dvh;
   }
-  .has-practice-board .player-screen { overflow: auto; transform: translateZ(0); }
+  .has-practice-board .player-screen {
+    overflow: auto;
+    transform: translateZ(0);
+    color-scheme: dark;
+    scrollbar-color: #6e556f #171321;
+  }
+  .has-practice-board .player-screen .role-grid { grid-template-columns: minmax(0, 1fr); }
+  .has-practice-board .player-screen .role-config-row { grid-template-columns: minmax(0, 1fr) 72px; }
+  .has-practice-board .player-screen .button-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .has-practice-board .player-screen .player-list { scrollbar-width: thin; }
   .has-practice-board .player-screen::before {
     content: "Your screen";
     display: block;

@@ -202,7 +202,7 @@ function syncBotBoard() {
       pane = { root, heading, token: bot.token };
       boardPlayers.set(bot.id, pane);
     }
-    pane.heading.textContent = bot.name;
+    pane.heading.textContent = bot.role ? `${bot.name} · ${bot.role}` : bot.name;
   }
 }
 
@@ -624,7 +624,7 @@ function renderBotDesk() {
   const inLobby = state.phase === "lobby";
   const showingBoard = boardOpen && state.bots.length > 0;
   return `
-    <details id="bot-desk" class="card bot-desk" ${botDeskOpen ? "open" : ""}>
+    <details id="bot-desk" class="card bot-desk${showingBoard ? " tiled" : ""}" ${botDeskOpen ? "open" : ""}>
       <summary>Practice bots <span class="badge">${state.bots.length}</span></summary>
       <div class="bot-actions">
         ${inLobby ? `
@@ -632,7 +632,7 @@ function renderBotDesk() {
           <button type="button" id="all-roles-btn" class="secondary">Set up all ${state.roleOrder.length} roles</button>` : ""}
         ${state.bots.length ? `<button type="button" id="toggle-board" class="secondary">${showingBoard ? "Hide board" : "Tile bot views"}</button>` : ""}
       </div>
-      ${state.bots.length ? `<ul class="bot-list">
+      ${state.bots.length && (!showingBoard || inLobby) ? `<ul class="bot-list">
         ${state.bots.map((bot) => `
           <li>
             <div>
