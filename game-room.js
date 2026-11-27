@@ -30,17 +30,28 @@ const ROLE_DESCRIPTIONS = {
   Fogmaster: "You win with the Vampires. Open up to three secret day ballots per match. On one secret ballot, you can privately add one extra vote to a player.",
 };
 
-const EVIL_ROLES = new Set(["Vampire", "Silencer", "Fogmaster"]);
+const DEFAULT_ROLE_OUTCOME = { alignment: "Town", winner: "Villagers" };
+const ROLE_OUTCOMES = {
+  Vampire: { alignment: "Evil", winner: "Vampires" },
+  Silencer: { alignment: "Evil", winner: "Vampires" },
+  Fogmaster: { alignment: "Evil", winner: "Vampires" },
+  Jester: { alignment: "Neutral", personalWinEvent: "votedOut" },
+  Thief: { alignment: "Neutral", winner: "Villagers" },
+};
 const NIGHT_ROLES = new Set(["Vampire", "Doctor", "Detective", "Hunter", "Transporter", "Thief", "Silencer"]);
 const ONE_USE_ROLES = new Set(["Hunter", "Thief", "Silencer", "Seer"]);
 const MAX_SECRET_BALLOTS = 3;
 const OATH_MODES = ["off", "random-town", "random-any", "town", "non-evil", "evil", "everyone"];
 
-function alignment(role) {
-  if (EVIL_ROLES.has(role)) return "Evil";
-  if (role === "Jester" || role === "Thief") return "Neutral";
-  return "Town";
+function roleOutcome(role) {
+  return ROLE_OUTCOMES[role] ?? DEFAULT_ROLE_OUTCOME;
 }
+
+const roleAlignments = Object.fromEntries(ROLE_ORDER.map((role) => [role, roleOutcome(role).alignment]));
+const roleWinGoals = Object.fromEntries(ROLE_ORDER.map((role) => {
+  const { personalWinEvent, winner } = roleOutcome(role);
+  return [role, personalWinEvent ? "Personal goal" : `Wins with ${winner}`];
+}));
 
 const audioTestCue = { id: 0, text: "Announcements are on." };
 const MAX_PLAYERS = 24;
@@ -206,7 +217,7 @@ function createRoom(io, code, hostSession, timing, practice = false) {
   function knownPlayers(me) {
     if (me.role !== "Vampire" && me.role !== "Jester") return [];
     return getAllPlayers().filter((player) => player !== me
-      && (me.role === "Vampire" ? EVIL_ROLES.has(player.role) : player.role === "Jester"))
+      && (me.role === "Vampire" ? roleOutcome(player.role).winner === "Vampires" : player.role === "Jester"))
       .map(({ name, role }) => ({ name, role }));
   }
 
@@ -231,7 +242,8 @@ function createRoom(io, code, hostSession, timing, practice = false) {
       roleOrder: ROLE_ORDER,
       roleDescriptions: ROLE_DESCRIPTIONS,
       roleConfig: cloneRoleConfig(),
-      roleAlignments: Object.fromEntries(ROLE_ORDER.map((role) => [role, alignment(role)])),
+      roleAlignments,
+      roleWinGoals,
       vampireCanSkip: game.vampireCanSkip,
       oathMode: game.oathMode,
       deadlockDraw: game.deadlockDraw,
@@ -251,7 +263,7 @@ function createRoom(io, code, hostSession, timing, practice = false) {
         isHost: player.isHost,
         isBot: Boolean(player.isBot),
         mayorRevealed: player.mayorRevealed,
-        jesterWon: Boolean(player.jesterWon),
+        personalWin: player.personalWin || null,
         publicRole: player.publicRole || null,
         role: game.phase === "gameover" ? player.role : null,
       })),
@@ -362,8 +374,8 @@ function createRoom(io, code, hostSession, timing, practice = false) {
     if (!practice || typeof token !== "string" || token.length !== 36 || emptySince !== null) return false;
     const bot = getAllPlayers().find((player) => player.botToken === token);
     if (!bot) return false;
-    if (typeof automatic === "boolean") bot.botAuto = automatic;
     attachPlayerSocket(bot, socket);
+    if (typeof automatic === "boolean") setBotControl(bot, automatic);
     emitAll();
     return true;
   }
@@ -375,6 +387,13 @@ function createRoom(io, code, hostSession, timing, practice = false) {
       mayorRevealed: false, privateMessages: [],
     };
     players.set(bot.id, bot);
+  }
+
+  function setBotControl(bot, automatic) {
+    bot.botAuto = automatic;
+    if (!automatic && game.phase === "night" && canAct(bot) && game.nightChoices.get(bot.id)?.automatic) {
+      game.nightChoices.delete(bot.id);
+    }
   }
 
   function rotateBotAccess() {
@@ -479,7 +498,7 @@ function createRoom(io, code, hostSession, timing, practice = false) {
         if (game.clock !== clock) break;
         if (!needsChoice(bot)) continue;
         if (atNight) {
-          submitNightAction(bot, { ...nextBotNightChoice(bot), nightKey: game.nightKey });
+          submitNightAction(bot, { ...nextBotNightChoice(bot), nightKey: game.nightKey }, true);
           emitPlayer(bot);
         } else {
           revealMayor(bot);
@@ -533,7 +552,7 @@ function createRoom(io, code, hostSession, timing, practice = false) {
 
   function resetPlayer(player, alive) {
     Object.assign(player, {
-      role: null, alive, mayorRevealed: false, abilityUsed: false, jesterWon: false,
+      role: null, alive, mayorRevealed: false, abilityUsed: false, personalWin: null,
       oath: null, publicRole: null, privateMessages: [], fogBallotsUsed: 0, fogBoostUsed: false,
     });
   }
@@ -544,8 +563,8 @@ function createRoom(io, code, hostSession, timing, practice = false) {
       "random-town": "Town", town: "Town", evil: "Evil",
     };
     const faction = groups[game.oathMode];
-    let selected = players.filter((player) => faction ? alignment(player.role) === faction
-      : game.oathMode !== "non-evil" || !EVIL_ROLES.has(player.role));
+    let selected = players.filter((player) => faction ? roleOutcome(player.role).alignment === faction
+      : game.oathMode !== "non-evil" || roleOutcome(player.role).alignment !== "Evil");
     if (game.oathMode.startsWith("random-")) selected = shuffle(selected).slice(0, 1);
     for (const player of selected) {
       player.oath = { targetId: null, shieldNight: null, revealed: false };
@@ -647,9 +666,7 @@ function createRoom(io, code, hostSession, timing, practice = false) {
         role: player.role || "No role",
         alive: player.alive,
         connected: player.connected,
-        won: player.jesterWon || (Boolean(player.role) && player.role !== "Jester"
-          && (winner === "Vampires" && EVIL_ROLES.has(player.role)
-            || winner === "Villagers" && !EVIL_ROLES.has(player.role))),
+        won: Boolean(player.personalWin) || (Boolean(player.role) && roleOutcome(player.role).winner === winner),
         rule: player.oath?.revealed ? "Accuser’s Oath" : null,
       })),
     };
@@ -669,9 +686,9 @@ function createRoom(io, code, hostSession, timing, practice = false) {
       return true;
     }
 
-    const evilCount = alive.filter((player) => EVIL_ROLES.has(player.role)).length;
-    if (evilCount >= alive.length - evilCount) {
-      setGameOver("Vampires", "The living evil team reached parity.");
+    const vampireTeamCount = alive.filter((player) => roleOutcome(player.role).winner === "Vampires").length;
+    if (vampireTeamCount >= alive.length - vampireTeamCount) {
+      setGameOver("Vampires", "The living Vampire team reached parity.");
       return true;
     }
 
@@ -779,7 +796,7 @@ function nightMoves() {
   }
 
   function reportInvestigation(detective, target) {
-    if (!EVIL_ROLES.has(target.role)) {
+    if (roleOutcome(target.role).alignment !== "Evil") {
       pushPrivateMessage(detective.id, `${target.name} is not evil.`);
       return;
     }
@@ -869,6 +886,14 @@ function nightMoves() {
     return roles.length === 3 && ["Vampire", "Jester", "Villager"].every((role) => roles.includes(role));
   }
 
+  function awardPersonalWin(player, event) {
+    if (!player.personalWin && roleOutcome(player.role).personalWinEvent === event) {
+      player.personalWin = player.role;
+      return player.personalWin;
+    }
+    return null;
+  }
+
   function resolveVotes() {
     if (game.phase !== "day") return;
 
@@ -900,10 +925,10 @@ function nightMoves() {
     } else {
       const eliminated = getPlayer(voteResult.targetId);
       if (eliminated?.alive) {
-        eliminated.jesterWon = eliminated.role === "Jester";
+        const personalWin = awardPersonalWin(eliminated, "votedOut");
         eliminate(eliminated);
-        const outcome = eliminated.jesterWon
-          ? `${eliminated.name} was voted out and earned a Jester win.` : `${eliminated.name} was voted out.`;
+        const outcome = personalWin
+          ? `${eliminated.name} was voted out and earned a ${personalWin} win.` : `${eliminated.name} was voted out.`;
         pushMessage(outcome);
         announceToTable(outcome);
         revealOath(eliminated);
@@ -915,7 +940,7 @@ function nightMoves() {
     startNight();
   }
 
-function activeMatch() {
+  function activeMatch() {
     return game.phase === "day" || game.phase === "night";
   }
 
@@ -959,7 +984,7 @@ function activeMatch() {
     return null;
   }
 
-  function submitNightAction(player, payload) {
+  function submitNightAction(player, payload, automatic = false) {
     if (!canAct(player) || game.phase !== "night" || payload?.nightKey !== game.nightKey) {
       return "The night has closed.";
     }
@@ -977,7 +1002,7 @@ function activeMatch() {
     const { targetId, targetIds } = payload;
     if (payload.skip === true) {
       if (role === "Vampire" && !game.vampireCanSkip && targets.length) return "Choose an available player.";
-      game.nightChoices.set(player.id, { skip: true });
+      game.nightChoices.set(player.id, { skip: true, automatic });
       return null;
     }
 
@@ -986,10 +1011,10 @@ function activeMatch() {
       if (!Array.isArray(targetIds) || targetIds.length !== 2 || targetIds[0] === targetIds[1] || !targetIds.every(valid)) {
         return "Choose two different living players.";
       }
-      game.nightChoices.set(player.id, { targetIds });
+      game.nightChoices.set(player.id, { targetIds, automatic });
     } else {
       if (!valid(targetId)) return "Choose an available player.";
-      game.nightChoices.set(player.id, { targetId });
+      game.nightChoices.set(player.id, { targetId, automatic });
     }
     return null;
   }
@@ -1088,7 +1113,7 @@ function activeMatch() {
     setBotAuto(socket, automatic) {
       const bot = getPlayer(socketToPlayerId.get(socket.id));
       if (!bot?.isBot || typeof automatic !== "boolean") return;
-      bot.botAuto = automatic;
+      setBotControl(bot, automatic);
       emitAll();
     },
 

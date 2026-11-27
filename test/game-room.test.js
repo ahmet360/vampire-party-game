@@ -151,6 +151,43 @@ test("a regular room cannot add bots", (t) => {
   assert.equal(room.joinBot(newSocket("bot"), "00000000-0000-0000-0000-000000000000"), false);
 });
 
+test("taking over during night replaces automatic choices without changing the shared clock", (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1000 });
+  const { room, host, newSocket, send } = roomFixture(t);
+  for (let i = 0; i < 3; i += 1) send(host, "addBot");
+  send(host, "updateConfig", { vampireCanSkip: true });
+  const [first, second] = host.state.bots;
+  const firstTile = newSocket("first-tile");
+  const secondTile = newSocket("second-tile");
+  assert.equal(room.joinBot(firstTile, first.token, true), true);
+  assert.equal(room.joinBot(secondTile, second.token, true), true);
+  send(host, "startGame");
+  const sharedClock = host.state.clock;
+  t.mock.timers.tick(400);
+  assert.equal(host.state.me.nightComplete, false);
+  assert.equal(firstTile.state.me.nightComplete, true);
+  assert.equal(secondTile.state.me.nightComplete, true);
+
+  send(firstTile, "setBotAuto", false);
+  const secondWindow = newSocket("second-window");
+  assert.equal(room.joinBot(secondWindow, second.token, false), true);
+  assert.equal(firstTile.state.me.nightComplete, false);
+  assert.equal(secondWindow.state.me.nightComplete, false);
+  assert.equal(firstTile.state.clock, sharedClock);
+  assert.equal(secondWindow.state.clock, sharedClock);
+
+  pick(send, secondWindow, { skip: true });
+  pick(send, firstTile, { skip: true });
+  assert.equal(host.state.me.nightComplete, false);
+  assert.equal(secondWindow.state.me.nightComplete, true);
+  send(firstTile, "setBotAuto", true);
+  send(firstTile, "setBotAuto", false);
+  assert.equal(firstTile.state.me.nightComplete, true);
+  assert.equal(host.state.phase, "night");
+  t.mock.timers.tick(400);
+  assert.equal(host.state.phase, "day");
+});
+
 test("night choices share one deadline and stay private until they resolve", (t) => {
   t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1000 });
   const { room, host, players, find, send } = gameFixture(t, ["Vampire", "Doctor", "Mayor", "Villager", "Detective"]);
@@ -251,14 +288,34 @@ test("Jesters know each other but each earns their own win", (t) => {
   };
   eliminateWithVotes(first);
   assert.equal(host.state.phase, "night");
-  assert.equal(host.state.players.find((player) => player.id === id(first)).jesterWon, true);
-  assert.equal(host.state.players.find((player) => player.id === id(second)).jesterWon, false);
+  assert.equal(host.state.players.find((player) => player.id === id(first)).personalWin, "Jester");
+  assert.equal(host.state.players.find((player) => player.id === id(second)).personalWin, null);
   send(host, "resolveNight");
   eliminateWithVotes(second);
   send(host, "resolveNight");
   eliminateWithVotes(vampire);
   assert.equal(host.state.gameOver.winner, "Villagers");
   assert.equal(host.state.gameOver.finalRoles.filter(({ role, won }) => role === "Jester" && won).length, 2);
+});
+
+test("Vampire allies share the team victory and only successful Jesters win alongside them", (t) => {
+  const { host, players, find, send } = gameFixture(t,
+    ["Vampire", "Silencer", "Fogmaster", "Jester", "Jester", "Villager", "Villager", "Villager"]);
+  const [winningJester, otherJester] = players.filter(({ state }) => state.me.role === "Jester");
+  const vampire = find("Vampire");
+  const villager = find("Villager");
+  assert.equal(host.state.roleWinGoals.Fogmaster, "Wins with Vampires");
+  assert.equal(host.state.roleWinGoals.Jester, "Personal goal");
+  send(host, "resolveNight");
+  for (const player of players) send(player, "vote", { targetId: id(player === winningJester ? villager : winningJester) });
+  pick(send, vampire, { targetId: id(villager) });
+  send(host, "resolveNight");
+  assert.equal(host.state.gameOver.winner, "Vampires");
+  const results = host.state.gameOver.finalRoles;
+  assert.equal(results.find(({ name }) => name === winningJester.state.me.name).won, true);
+  assert.equal(results.find(({ name }) => name === otherJester.state.me.name).won, false);
+  assert.deepEqual(results.filter(({ won, role }) => won && role !== "Jester").map(({ role }) => role).sort(),
+    ["Fogmaster", "Silencer", "Vampire"]);
 });
 
 for (const deadlockDraw of [true, false]) {

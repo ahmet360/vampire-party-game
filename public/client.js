@@ -27,14 +27,29 @@ const inBoard = location.pathname === "/practice/player";
 const isBotWindow = inBoard || botToken !== null;
 let connectBot = isBotWindow;
 let firstBotJoin = true;
+const savedRoom = isBotWindow ? null : getSavedRoom();
 const playerId = isBotWindow ? null : getPlayerId();
 if (inBoard) document.body.classList.add("board-player");
 
+function getSavedRoom() {
+  try {
+    const room = JSON.parse(sessionStorage.getItem("vampireRoom"));
+    return room?.code === invitedRoom && typeof room.name === "string" ? room : null;
+  } catch {
+    return null;
+  }
+}
+
 function getPlayerId() {
-  const storedId = localStorage.getItem("vampirePlayerId");
-  const id = /^[A-Za-z0-9_-]{22,80}$/.test(storedId || "") ? storedId : makePlayerId();
-  localStorage.setItem("vampirePlayerId", id);
-  return id;
+  // Resume an existing seat on refresh. Joining in a fresh tab creates a different seat.
+  if (!savedRoom) return makePlayerId();
+  try {
+    const storedId = savedRoom.sessionId ?? localStorage.getItem("vampirePlayerId");
+    if (/^[A-Za-z0-9_-]{22,80}$/.test(storedId || "")) return storedId;
+  } catch {
+    // The form can still be used if browser storage is unavailable.
+  }
+  return makePlayerId();
 }
 
 function makePlayerId() {
@@ -124,16 +139,9 @@ if (isBotWindow) {
   $("share-room-btn").classList.add("hidden");
   $("leave-room-btn").textContent = "Release bot";
   document.title = "Bot player view | Vampire";
-} else {
-  try {
-    const previousRoom = JSON.parse(sessionStorage.getItem("vampireRoom"));
-    if (previousRoom?.code === invitedRoom && typeof previousRoom.name === "string") {
-      $("name-input").value = previousRoom.name;
-      joinDetails = { ...previousRoom, sessionId: playerId };
-    }
-  } catch {
-    // A fresh form is still available when browser storage is unavailable.
-  }
+} else if (savedRoom) {
+  $("name-input").value = savedRoom.name;
+  joinDetails = { ...savedRoom, sessionId: playerId };
 }
 
 $("join-form").addEventListener("submit", (event) => {
@@ -427,7 +435,7 @@ function renderPlayerList() {
       const tags = [];
       if (player.isHost) tags.push("HOST");
       if (player.isBot) tags.push("BOT");
-      if (player.jesterWon) tags.push("Jester win");
+      if (player.personalWin) tags.push(`${player.personalWin} win`);
       if (state.phase !== "gameover" && player.publicRole) tags.push(`Revealed ${player.publicRole}`);
       if (!player.connected) tags.push("OFFLINE");
       if (state.phase === "gameover" && player.role) tags.push(player.role);
@@ -749,7 +757,8 @@ function renderRoleConfigRow(role) {
     <div class="role-config-row">
       <label class="toggle-row">
         <input type="checkbox" class="role-enabled" data-role="${escapeHtml(role)}" ${config.enabled ? "checked" : ""}>
-        <span>${escapeHtml(role)} <small class="muted">${escapeHtml(state.roleAlignments[role])}</small></span>
+        <span>${escapeHtml(role)} <small class="muted">${escapeHtml(state.roleAlignments[role])}
+          ${state.roleAlignments[role] !== "Town" ? ` · ${escapeHtml(state.roleWinGoals[role])}` : ""}</small></span>
       </label>
       <select class="role-count" data-role="${escapeHtml(role)}" aria-label="${escapeHtml(role)} count">
         ${options}
@@ -1084,7 +1093,11 @@ socket.on("state", (newState) => {
       document.title = `${state.me.name} | Vampire practice`;
     } else {
       joinDetails = { code: state.roomCode, name: state.me.name, sessionId: playerId };
-      sessionStorage.setItem("vampireRoom", JSON.stringify({ code: state.roomCode, name: state.me.name }));
+      try {
+        sessionStorage.setItem("vampireRoom", JSON.stringify(joinDetails));
+      } catch {
+        // Keep playing even if this browser cannot preserve the seat after refresh.
+      }
       history.replaceState(null, "", roomLink());
     }
   }

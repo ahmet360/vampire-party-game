@@ -2,7 +2,7 @@
 
 Vampire is a real-time social deduction game. Create a room, then share its six-character code or invite link. Players use their phones to make private choices and vote. An optional tablet announcer reads phase changes and public outcomes aloud.
 
-- All living players share a 30-second night. Their screens cover their choices after they lock them in. Villagers, Mayors and Jesters pick a name as cover.
+- All living players can choose at the same time during the same 30-second night. Each player's screen covers their choice as soon as they lock it in. Villagers, Mayors and Jesters pick a name as cover.
 - Use **Reveal role** for private role information and special controls. A Mayor can reveal any time during play. A Hunter can spend their one shot by day or night.
 - The host chooses which roles are dealt. Jesters know each other and earn individual wins when voted out. The town wins when every Vampire is gone. The evil team wins if it reaches parity while a Vampire survives.
 - A Thief can steal a role once by targeting another player at night. The target’s night move fizzles, and the role changes at the start of the next night if both players survive. A Silencer can block one night move per match. At night, blocks resolve before thefts, and Transporter swaps affect saves, investigations, shots, and kill votes.
@@ -18,7 +18,11 @@ The room creator hosts automatically. To use the table announcer, open the room�
 
 ## Practice with bots
 
-Check **Practice room** when creating a room. Use **Add bot** for individual seats or **Set up all 12 roles** to deal one of each role, fill the empty seats and open the tiled practice board. You can also open the board with **Tile bot views**. Bots on the board play automatically until you select **Take control**. With the board hidden, **Open window** opens a separate, positioned window for one bot in manual mode.
+Check **Practice room** when creating a room. Use **Add bot** for individual seats or **Set up all 12 roles** to deal one of each role, fill the empty seats and open the tiled practice board. You can also open the board with **Tile bot views**. Bots on the board play automatically until you select **Take control**. During an open night, taking control lets you replace that bot’s automatic choice before the same deadline. With the board hidden, **Open window** opens a separate, positioned window for one bot in manual mode.
+
+## Defining a role’s win
+
+In `game-room.js`, a role’s alignment determines how the Detective reads it. Its outcome separately specifies a team victory or an individual win event. The Fogmaster and Silencer share the Vampires’ victory and count toward their parity. The Jester earns a personal win on being voted out, and the match continues.
 
 ## Run locally
 
