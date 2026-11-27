@@ -72,9 +72,10 @@ test("only the practice host receives bot access and a bot gets its own role", (
   assert.equal(room.joinBot(newSocket("removed"), removed.token), false);
 
   send(host, "setUpAllRoles");
-  assert.equal(host.state.playerCount, 11);
-  assert.equal(host.state.bots.length, 9);
-  assert.equal(host.state.selectedRoleCount, 11);
+  const roleCount = host.state.roleOrder.length;
+  assert.equal(host.state.playerCount, roleCount);
+  assert.equal(host.state.bots.length, roleCount - 2);
+  assert.equal(host.state.selectedRoleCount, roleCount);
   const bot = host.state.bots[0];
   const botWindow = newSocket("bot");
   assert.equal(room.joinBot(botWindow, bot.id), false);
@@ -374,4 +375,99 @@ test("night Seer guesses wait until dawn and can be blocked", (t) => {
   guess(send, seer, vampire, "Silencer");
   send(host, "resolveNight");
   assert.equal(seer.state.me.alive, false);
+});
+
+function useFog(send, player, event, payload = {}) {
+  let result;
+  send(player, event, { dayNumber: player.state.dayNumber, ...payload }, (error) => { result = error; });
+  return result;
+}
+
+test("the Fogmaster can open three secret ballots and use one private boost per match", (t) => {
+  const { room, host, find, send } = gameFixture(t, ["Vampire", "Fogmaster", "Villager", "Villager", "Villager"]);
+  const fog = find("Fogmaster");
+  const vampire = find("Vampire");
+  const villager = find("Villager");
+  assert.equal(fog.state.roleAlignments.Fogmaster, "Evil");
+  assert.ok(vampire.state.me.knownPlayers.some(({ role }) => role === "Fogmaster"));
+  assert.match(useFog(send, fog, "openSecretBallot"), /unavailable/);
+
+  send(host, "resolveNight");
+  send(villager, "vote", { targetId: id(vampire) });
+  assert.equal(room.buildTableState().votesCast, 1);
+  assert.match(useFog(send, villager, "openSecretBallot"), /unavailable/);
+  assert.match(useFog(send, fog, "openSecretBallot", { dayNumber: 0 }), /unavailable/);
+  assert.match(useFog(send, fog, "boostFogVote", { targetId: id(vampire) }), /during a secret ballot/);
+  assert.equal(useFog(send, fog, "openSecretBallot"), null);
+  assert.equal(fog.state.me.fogmaster.ballotsLeft, 2);
+  assert.equal(villager.state.me.dayVoteTarget, id(vampire));
+  assert.equal(villager.state.me.fogmaster, null);
+  assert.equal(villager.state.votesCast, null);
+  assert.equal(room.buildTableState().votesCast, null);
+  assert.match(room.buildTableState().cues.at(-1).text, /^A secret ballot is open/);
+  assert.match(useFog(send, fog, "openSecretBallot"), /already open/);
+
+  const received = villager.received;
+  send(vampire, "vote", { targetId: id(fog) });
+  assert.equal(villager.received, received);
+  assert.match(useFog(send, fog, "boostFogVote", { targetId: id(fog) }), /available player/);
+  assert.equal(useFog(send, fog, "boostFogVote", { targetId: id(vampire) }), null);
+  assert.equal(fog.state.me.fogmaster.boostTargetId, id(vampire));
+  assert.equal(villager.received, received);
+  assert.match(useFog(send, fog, "boostFogVote", { targetId: id(villager) }), /already used/);
+
+  for (let day = 2; day <= 3; day += 1) {
+    send(host, "forceSleep");
+    send(host, "resolveNight");
+    assert.equal(useFog(send, fog, "openSecretBallot"), null);
+    assert.equal(fog.state.me.fogmaster.ballotsLeft, 3 - day);
+    assert.equal(fog.state.me.fogmaster.boostTargetId, null);
+    assert.match(useFog(send, fog, "boostFogVote", { targetId: id(villager) }), /already used/);
+  }
+  send(host, "forceSleep");
+  send(host, "resolveNight");
+  assert.equal(room.buildTableState().secretBallot, false);
+  assert.match(useFog(send, fog, "openSecretBallot"), /all three/);
+  send(host, "resetGame");
+  send(host, "startGame");
+  assert.deepEqual(find("Fogmaster").state.me.fogmaster, { ballotsLeft: 3, boostUsed: false, boostTargetId: null });
+});
+
+test("a secret ballot stays open until the deadline and the Fogmaster’s bonus breaks a tie", (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1000 });
+  const { host, players, find, send } = gameFixture(t,
+    ["Vampire", "Fogmaster", "Villager", "Villager", "Villager", "Villager"]);
+  const vampire = find("Vampire");
+  const fog = find("Fogmaster");
+  const [first, second, third, fourth] = players.filter(({ state }) => state.me.role === "Villager");
+  send(host, "resolveNight");
+  assert.equal(useFog(send, fog, "openSecretBallot"), null);
+  for (const player of [vampire, fog, second]) send(player, "vote", { targetId: id(first) });
+  for (const player of [first, third, fourth]) send(player, "vote", { targetId: id(vampire) });
+  assert.equal(host.state.phase, "day");
+  assert.equal(useFog(send, fog, "boostFogVote", { targetId: id(vampire) }), null);
+  t.mock.timers.tick(1199);
+  assert.equal(host.state.phase, "day");
+  t.mock.timers.tick(1);
+  assert.equal(vampire.state.me.alive, false);
+  assert.equal(first.state.me.alive, true);
+  assert.equal(host.state.gameOver.winner, "Villagers");
+  assert.ok(host.state.messages.every(({ text }) => !text.includes("+1") && !text.includes("Fogmaster")));
+});
+
+test("a Thief inherits the Fogmaster’s remaining charges", (t) => {
+  const { host, find, send } = gameFixture(t,
+    ["Vampire", "Fogmaster", "Thief", "Villager", "Villager", "Villager"]);
+  const fog = find("Fogmaster");
+  const thief = find("Thief");
+  send(host, "resolveNight");
+  assert.equal(useFog(send, fog, "openSecretBallot"), null);
+  assert.equal(useFog(send, fog, "boostFogVote", { targetId: id(thief) }), null);
+  send(host, "forceSleep");
+  pick(send, thief, { targetId: id(fog) });
+  send(host, "resolveNight");
+  send(host, "forceSleep");
+  assert.equal(thief.state.me.role, "Fogmaster");
+  assert.deepEqual(thief.state.me.fogmaster, { ballotsLeft: 2, boostUsed: true, boostTargetId: null });
+  assert.equal(fog.state.me.fogmaster, null);
 });

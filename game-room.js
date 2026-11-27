@@ -12,6 +12,7 @@ const ROLE_ORDER = [
   "Thief",
   "Silencer",
   "Seer",
+  "Fogmaster",
 ];
 
 const ROLE_DESCRIPTIONS = {
@@ -26,11 +27,13 @@ const ROLE_DESCRIPTIONS = {
   Thief: "Once per match, choose someone at night to steal their role without seeing it first. Their night ability fizzles. If you both survive, you swap into their role next night and they become a Villager. Until then, you win with the Villagers.",
   Silencer: "Once per match, choose a player to block their night ability. You win with the Vampires. They can see that you are on their team.",
   Seer: "Your private role card highlights players with a role. Keep those names to yourself. You have one guess: name a player and their exact role. If you’re right, the game reveals you and their role. If you’re wrong, you die.",
+  Fogmaster: "You win with the Vampires. Open up to three secret day ballots per match. On one secret ballot, you can privately add one extra vote to a player.",
 };
 
-const EVIL_ROLES = new Set(["Vampire", "Silencer"]);
+const EVIL_ROLES = new Set(["Vampire", "Silencer", "Fogmaster"]);
 const NIGHT_ROLES = new Set(["Vampire", "Doctor", "Detective", "Hunter", "Transporter", "Thief", "Silencer"]);
 const ONE_USE_ROLES = new Set(["Hunter", "Thief", "Silencer", "Seer"]);
+const MAX_SECRET_BALLOTS = 3;
 const OATH_MODES = ["off", "random-town", "random-any", "town", "non-evil", "evil", "everyone"];
 
 function alignment(role) {
@@ -82,6 +85,8 @@ function createRoom(io, code, hostSession, timing, practice = false) {
     pendingThefts: [],
     clock: null,
     dayVotes: {},
+    secretBallot: false,
+    fogBoosts: new Map(),
     doctorLastSave: {},
     detectiveMemory: {},
     messages: [],
@@ -167,7 +172,8 @@ function createRoom(io, code, hostSession, timing, practice = false) {
       nightNumber: game.nightNumber,
       playerCount: getAllPlayers().length,
       aliveCount: getAlivePlayers().length,
-      votesCast: Object.keys(game.dayVotes).length,
+      secretBallot: game.secretBallot,
+      votesCast: game.secretBallot ? null : Object.keys(game.dayVotes).length,
       winner: game.gameOver?.winner || null,
       cues: game.tableCues,
     };
@@ -230,7 +236,8 @@ function createRoom(io, code, hostSession, timing, practice = false) {
       oathMode: game.oathMode,
       deadlockDraw: game.deadlockDraw,
       nightKey: game.phase === "night" ? game.nightKey : null,
-      votesCast: Object.keys(game.dayVotes).length,
+      secretBallot: game.secretBallot,
+      votesCast: game.secretBallot ? null : Object.keys(game.dayVotes).length,
       messages: game.messages.slice(-30),
       gameOver: game.gameOver,
       selectedRoleCount: countSelectedRoles(),
@@ -285,6 +292,11 @@ function createRoom(io, code, hostSession, timing, practice = false) {
             nightTargetIds: game.phase === "night" && me.alive
               ? nightTargets(me, nightRole(me)).map(({ id }) => id) : [],
             dayVoteTarget: game.dayVotes[me.id] || null,
+            fogmaster: me.role === "Fogmaster" ? {
+              ballotsLeft: MAX_SECRET_BALLOTS - me.fogBallotsUsed,
+              boostUsed: me.fogBoostUsed,
+              boostTargetId: game.fogBoosts.get(me.id) || null,
+            } : null,
             doctorLastSave: game.doctorLastSave[me.id] || null,
           }
         : null,
@@ -522,7 +534,7 @@ function createRoom(io, code, hostSession, timing, practice = false) {
   function resetPlayer(player, alive) {
     Object.assign(player, {
       role: null, alive, mayorRevealed: false, abilityUsed: false, jesterWon: false,
-      oath: null, publicRole: null, privateMessages: [],
+      oath: null, publicRole: null, privateMessages: [], fogBallotsUsed: 0, fogBoostUsed: false,
     });
   }
 
@@ -612,6 +624,8 @@ function createRoom(io, code, hostSession, timing, practice = false) {
     game.nightKey = null;
     game.pendingThefts = [];
     game.dayVotes = {};
+    game.secretBallot = false;
+    game.fogBoosts.clear();
     game.doctorLastSave = {};
     game.detectiveMemory = {};
     game.messages = [];
@@ -675,6 +689,10 @@ function createRoom(io, code, hostSession, timing, practice = false) {
       }
       thief.role = target.role;
       thief.abilityUsed = target.abilityUsed || target.role === "Thief";
+      if (thief.role === "Fogmaster") {
+        thief.fogBallotsUsed = target.fogBallotsUsed;
+        thief.fogBoostUsed = target.fogBoostUsed;
+      }
       target.role = "Villager";
       target.abilityUsed = false;
       target.mayorRevealed = false;
@@ -693,6 +711,8 @@ function createRoom(io, code, hostSession, timing, practice = false) {
     game.nightNumber += 1;
     game.nightChoices.clear();
     game.dayVotes = {};
+    game.secretBallot = false;
+    game.fogBoosts.clear();
     game.nightKey = randomUUID();
 
     const message = `Night ${game.nightNumber}. Everyone has ${Math.ceil(timing.night / 1000)} seconds to make a private choice.`;
@@ -862,6 +882,10 @@ function nightMoves() {
       const weight = voter.role === "Mayor" && voter.mayorRevealed ? 2 : 1;
       tally[targetId] = (tally[targetId] || 0) + weight;
     });
+    for (const [voterId, targetId] of game.fogBoosts) {
+      const voter = getPlayer(voterId);
+      if (voter?.alive && canVoteFor(voter, targetId)) tally[targetId] = (tally[targetId] || 0) + 1;
+    }
 
     const voteResult = getTopTargetFromTally(tally);
 
@@ -981,11 +1005,20 @@ function activeMatch() {
 
   function submitVote(voter, targetId) {
     if (!canAct(voter) || game.phase !== "day") return false;
-    if (!isAlive(targetId) || targetId === voter.id || voter.oath?.targetId === targetId) return false;
+    if (!canVoteFor(voter, targetId)) return false;
 
     game.dayVotes[voter.id] = targetId;
-    if (allDayVotesSubmitted()) resolveVotes();
+    if (!game.secretBallot && allDayVotesSubmitted()) resolveVotes();
     return true;
+  }
+
+  function canVoteFor(voter, targetId) {
+    return isAlive(targetId) && targetId !== voter.id && voter.oath?.targetId !== targetId;
+  }
+
+  function canUseFogmaster(player, dayNumber) {
+    return canAct(player) && game.phase === "day" && dayNumber === game.dayNumber
+      && player.role === "Fogmaster" && !isAutomaticBot(player);
   }
 
   function resolveSeerGuess(seer, target, guess) {
@@ -1161,7 +1194,7 @@ function activeMatch() {
         eliminate(victim);
         revealOath(victim);
       }
-      if (!checkWinConditions() && allDayVotesSubmitted()) resolveVotes();
+      if (!checkWinConditions() && !game.secretBallot && allDayVotesSubmitted()) resolveVotes();
       emitAll();
     },
 
@@ -1172,7 +1205,40 @@ function activeMatch() {
 
     vote(socket, payload) {
       const voter = getPlayer(socketToPlayerId.get(socket.id));
-      if (!isAutomaticBot(voter) && submitVote(voter, payload?.targetId)) emitAll();
+      if (isAutomaticBot(voter) || !submitVote(voter, payload?.targetId)) return;
+      if (game.secretBallot) emitPlayer(voter);
+      else emitAll();
+    },
+
+    openSecretBallot(socket, payload, acknowledge) {
+      const player = getPlayer(socketToPlayerId.get(socket.id));
+      let error = null;
+      if (!canUseFogmaster(player, payload?.dayNumber)) error = "That ability is unavailable.";
+      else if (game.secretBallot) error = "A secret ballot is already open.";
+      else if (player.fogBallotsUsed >= MAX_SECRET_BALLOTS) error = "You’ve used all three secret ballots.";
+      else {
+        game.secretBallot = true;
+        player.fogBallotsUsed += 1;
+        const message = "A secret ballot is open. Vote privately on your phones.";
+        pushMessage(message);
+        announceToTable(message);
+        emitAll();
+      }
+      if (typeof acknowledge === "function") acknowledge(error);
+    },
+
+    boostFogVote(socket, payload, acknowledge) {
+      const player = getPlayer(socketToPlayerId.get(socket.id));
+      let error = null;
+      if (!canUseFogmaster(player, payload?.dayNumber) || !game.secretBallot) error = "Your +1 is available during a secret ballot.";
+      else if (player.fogBoostUsed) error = "You’ve already used your +1.";
+      else if (!canVoteFor(player, payload.targetId)) error = "Choose an available player.";
+      else {
+        player.fogBoostUsed = true;
+        game.fogBoosts.set(player.id, payload.targetId);
+        emitPlayer(player);
+      }
+      if (typeof acknowledge === "function") acknowledge(error);
     },
 
     resolveVotes(socket) {

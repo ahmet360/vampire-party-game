@@ -176,8 +176,8 @@ tableSocket.on("tableState", (state) => {
     progressLabel.textContent = "";
   } else if (state.phase === "day") {
     phaseLabel.textContent = `Room ${roomCode} · Day ${state.dayNumber}`;
-    turnLabel.textContent = "Discuss and vote";
-    progressLabel.textContent = `${state.votesCast} of ${state.aliveCount} votes in`;
+    turnLabel.textContent = state.secretBallot ? "Secret ballot" : "Discuss and vote";
+    progressLabel.textContent = state.secretBallot ? "Cast your private vote on your phone." : `${state.votesCast} of ${state.aliveCount} votes in`;
   } else if (state.phase === "gameover") {
     phaseLabel.textContent = `Room ${roomCode} · Game over`;
     const heading = { "No winner": "The host ended the game", Draw: "Draw" };

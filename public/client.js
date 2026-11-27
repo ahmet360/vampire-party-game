@@ -9,6 +9,7 @@ let privateView = false;
 let roleRevealed = false;
 let choosingAccuser = false;
 let choosingShot = false;
+let choosingFogBoost = false;
 let seerTargetId = null;
 let seerGuessRole = "";
 let pendingDayChoice = null;
@@ -387,6 +388,7 @@ function resetPrivateView() {
   roleRevealed = false;
   choosingAccuser = false;
   choosingShot = false;
+  choosingFogBoost = false;
   seerTargetId = null;
   seerGuessRole = "";
   pendingDayChoice = null;
@@ -456,7 +458,7 @@ function renderStatusCard() {
         <span class="badge">${escapeHtml(roundText || `${state.playerCount} player${state.playerCount === 1 ? "" : "s"}`)}</span>
       </div>
       <p class="muted">Alive players: ${state.aliveCount}</p>
-      ${state.phase === "day" ? `<p>${state.votesCast} of ${state.aliveCount} votes in</p>${gameClock.markup("Voting ends in")}` : ""}
+      ${state.phase === "day" ? `<p>${state.secretBallot ? "Secret ballot in progress" : `${state.votesCast} of ${state.aliveCount} votes in`}</p>${gameClock.markup("Voting ends in")}` : ""}
       ${state.phase === "lobby" ? `<p>${state.practice ? "Practice room. The host can tile the bot players’ views." : "Share the room code or invite link."} Everyone chooses during the same ${Math.ceil(state.timing.night / 1000)} seconds at night.</p>` : ""}
       ${state.phase === "gameover" ? renderGameOverSummary() : ""}
     </section>
@@ -484,6 +486,7 @@ function renderRoleCard() {
       ${renderKnownPlayers(me)}
       ${renderMayorRevealButton()}
       ${renderDayShot(me)}
+      ${renderFogmasterCard(me)}
       ${renderSeerCard(me)}
       ${renderOathCard(me)}
       ${renderPrivateMessages()}
@@ -506,12 +509,30 @@ function canUseRoleControls() {
 
 function renderDayShot(me) {
   if (!canUseRoleControls() || state.phase !== "day" || me.role !== "Hunter" || me.abilityUsed) return "";
-  if (pendingDayChoice?.event === "hunterShot") return renderDayConfirmation("Fire your shot");
+  if (pendingDayChoice?.event === "hunterShot") return renderDayConfirmation("Fire your shot at");
   return `<div class="private-box">
     <button id="toggle-hunter-picker" class="secondary">${choosingShot ? "Cancel shot" : "Choose a daytime shot"}</button>
     ${choosingShot ? `<div class="target-grid">
       ${choiceButtons(otherAlivePlayers().filter(({ id }) => id !== me.oath?.targetId), "day-shot")}
     </div>` : ""}
+  </div>`;
+}
+
+function renderFogmasterCard(me) {
+  if (!me.fogmaster || state.phase !== "day") return "";
+  const { ballotsLeft, boostUsed, boostTargetId } = me.fogmaster;
+  const canAct = canUseRoleControls() && !savingTurn;
+  return `<div class="private-box">
+    <h3>Fogmaster</h3>
+    <p>${ballotsLeft} of 3 secret ballots left. ${boostUsed ? "Your +1 has been used." : "Your +1 is available."}</p>
+    ${boostTargetId ? `<p>+1 added to ${escapeHtml(playerName(boostTargetId))}.</p>` : ""}
+    ${canAct && !state.secretBallot && ballotsLeft
+      ? '<button id="open-secret-ballot" type="button" class="secondary">Open secret ballot</button>' : ""}
+    ${canAct && state.secretBallot && !boostUsed ? `
+      ${pendingDayChoice?.event === "boostFogVote" ? renderDayConfirmation("Add one vote to")
+        : `<button id="toggle-fog-picker" type="button" class="secondary">${choosingFogBoost ? "Cancel" : "Add +1 to a player"}</button>
+        ${choosingFogBoost ? `<div class="target-grid">${choiceButtons(dayVoteTargets(), "fog-target")}</div>` : ""}`}
+    ` : ""}
   </div>`;
 }
 
@@ -570,7 +591,7 @@ function renderOathCard(me) {
 }
 
 function renderDayConfirmation(verb) {
-  return `<p>${escapeHtml(verb)}: ${escapeHtml(playerName(pendingDayChoice.targetId))}?</p>
+  return `<p>${escapeHtml(verb)} ${escapeHtml(playerName(pendingDayChoice.targetId))}?</p>
     <div class="night-options">
       <button type="button" id="confirm-day-btn" class="primary">Confirm</button>
       <button type="button" id="cancel-day-btn" class="secondary">Back</button>
@@ -777,14 +798,18 @@ function renderNightActions() {
 function renderDayVoting() {
   return `
     <section class="card action-card">
-      <h2>Day vote</h2>
-      <p>Vote for one alive player. A revealed Mayor counts as two votes.</p>
+      <h2>${state.secretBallot ? "Secret ballot" : "Day vote"}</h2>
+      <p>${state.secretBallot ? "Your choice is private. The result is announced when the ballot closes." : "Vote for one alive player. A revealed Mayor counts as two votes."}</p>
       ${state.me.dayVoteTarget ? `<p class="muted">Your current vote: ${escapeHtml(playerName(state.me.dayVoteTarget))}</p>` : ""}
       <div class="target-grid">
-        ${choiceButtons(otherAlivePlayers().filter(({ id }) => id !== state.me.oath?.targetId), "vote-target", [state.me.dayVoteTarget])}
+        ${choiceButtons(dayVoteTargets(), "vote-target", [state.me.dayVoteTarget])}
       </div>
     </section>
   `;
+}
+
+function dayVoteTargets() {
+  return otherAlivePlayers().filter(({ id }) => id !== state.me.oath?.targetId);
 }
 
 function choiceButtons(players, action, selected = []) {
@@ -929,12 +954,26 @@ function bindDynamicButtons() {
 }
 
 function bindRoleControls() {
+  $("open-secret-ballot")?.addEventListener("click", () => sendLockedChoice("openSecretBallot", {}));
+  $("toggle-fog-picker")?.addEventListener("click", () => {
+    pendingDayChoice = null;
+    choosingAccuser = false;
+    choosingFogBoost = !choosingFogBoost;
+    render();
+  });
+  document.querySelectorAll("[data-fog-target]").forEach((button) => {
+    button.addEventListener("click", () => {
+      pendingDayChoice = { event: "boostFogVote", targetId: button.dataset.fogTarget };
+      render();
+    });
+  });
   $("pick-accuser")?.addEventListener("click", () => {
     privateView = false;
     pendingNightChoice = null;
     pendingDayChoice = null;
     choosingAccuser = true;
     choosingShot = false;
+    choosingFogBoost = false;
     seerTargetId = null;
     seerGuessRole = "";
     render();
@@ -972,6 +1011,7 @@ function bindRoleControls() {
   });
   $("confirm-day-btn")?.addEventListener("click", () => {
     const { event, targetId } = pendingDayChoice;
+    if (event === "boostFogVote") return sendLockedChoice(event, { targetId });
     if (!socket.connected) return showToast("Reconnecting. Try again in a moment.");
     socket.emit(event, targetId);
     hidePrivateView();
@@ -1010,7 +1050,7 @@ function sendLockedChoice(event, payload) {
   const { nightKey, dayNumber, phase } = state;
   savingTurn = true;
   hidePrivateView();
-  socket.timeout(6500).emit(event, { ...payload, nightKey }, (error, message) => {
+  socket.timeout(6500).emit(event, { ...payload, nightKey, dayNumber }, (error, message) => {
     if (state?.nightKey !== nightKey || state?.phase !== phase || state?.dayNumber !== dayNumber) return;
     savingTurn = false;
     render();
