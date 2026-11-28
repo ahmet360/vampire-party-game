@@ -5,20 +5,21 @@ const { isIP } = require("node:net");
 const path = require("node:path");
 const { Server } = require("socket.io");
 const { createRoom } = require("./game-room");
-const { createLunaSpeaker } = require("./luna-discussion");
+const { createGeminiBot } = require("./gemini-bot");
 const { renderAnnouncement } = require("./announce-audio");
 
 const app = express();
 const server = http.createServer(app);
 const port = Number(process.env.PORT || 3000);
 const host = process.env.HOST || "0.0.0.0";
-const renderOrigin = process.env.RENDER_EXTERNAL_URL ? new URL(process.env.RENDER_EXTERNAL_URL).origin : null;
-const websocketSource = renderOrigin ? renderOrigin.replace(/^https:/, "wss:") : "ws: wss:";
+const configuredUrl = process.env.PUBLIC_ORIGIN || process.env.RENDER_EXTERNAL_URL;
+const publicUrl = configuredUrl ? new URL(configuredUrl) : null;
+const websocketSource = publicUrl ? publicUrl.origin.replace(/^http/, "ws") : "ws: wss:";
 const io = new Server(server, {
   maxHttpBufferSize: 8192,
   allowRequest({ headers: { origin, host } }, callback) {
-    const allowed = !origin || (renderOrigin
-      ? origin === renderOrigin
+    const allowed = !origin || (publicUrl
+      ? origin === publicUrl.origin
       : origin === `http://${host}` || origin === `https://${host}`);
     callback(null, allowed);
   },
@@ -32,13 +33,13 @@ const roomAlphabet = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
 const rooms = new Map();
 const creationAttempts = new Map();
 const voiceCache = new WeakMap();
-const speakWithLuna = createLunaSpeaker(process.env.OPENAI_API_KEY);
+const hostAi = process.env.BOT_AI_MODE === "host-owned" ? { allowed: canConfigureBotAi, create: createGeminiBot } : null;
 const playerEvents = [
   "updateConfig", "startGame", "resetGame", "endGame", "forceSleep", "resolveNight",
   "nightAction", "voteNightExtension", "revealMayor", "startVoting", "vote", "resolveVotes", "discuss",
   "openSecretBallot", "boostFogVote",
   "recordAccuser", "revealOath", "seerGuess", "hunterShot",
-  "addBot", "removeBot", "setUpAllRoles", "setBotAuto",
+  "addBot", "removeBot", "setUpAllRoles", "setBotAuto", "configureBotAi",
 ];
 
 app.disable("x-powered-by");
@@ -92,8 +93,21 @@ function validSessionId(value) {
   return typeof value === "string" && /^[A-Za-z0-9_-]{22,80}$/.test(value);
 }
 
+function canConfigureBotAi(socket) {
+  if (!socket) return false;
+  const { address, headers } = socket.handshake;
+  const { host: requestHost, origin } = headers;
+  if (publicUrl?.protocol === "https:") {
+    return requestHost === publicUrl.host && (!origin || origin === publicUrl.origin)
+      && headers["x-forwarded-proto"] === "https";
+  }
+  const localAddress = ["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(address);
+  const localHostName = /^(?:localhost|127\.0\.0\.1|\[::1\])(?::\d+)?$/i.test(requestHost || "");
+  return localAddress && localHostName && (!origin || origin === `http://${requestHost}`);
+}
+
 function mayCreateRoom(socket) {
-  const forwarded = renderOrigin && socket.handshake.headers["x-forwarded-for"]?.split(",").at(-1)?.trim();
+  const forwarded = publicUrl && socket.handshake.headers["x-forwarded-for"]?.split(",").at(-1)?.trim();
   const address = isIP(forwarded || "") ? forwarded : socket.handshake.address;
   const now = Date.now();
   const existing = creationAttempts.get(address);
@@ -114,7 +128,7 @@ io.on("connection", (socket) => {
       return socket.emit("errorMessage", "Room creation is busy. Give it a moment and try again.");
     }
     const code = newRoomCode();
-    const room = createRoom(io, code, payload.sessionId, timing, payload.practice === true, speakWithLuna);
+    const room = createRoom(io, code, payload.sessionId, timing, payload.practice === true, hostAi);
     rooms.set(code, room);
     room.join(socket, payload.sessionId, payload.name);
   });

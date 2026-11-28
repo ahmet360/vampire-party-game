@@ -1,7 +1,7 @@
 const assert = require("node:assert/strict");
 const test = require("node:test");
 const { createRoom } = require("../game-room");
-const { createLunaSpeaker } = require("../luna-discussion");
+const { createGeminiBot } = require("../gemini-bot");
 const FIRST_NIGHT = 20800;
 
 function cast(send, player, targetId, ballotKey = player.state.ballotKey) {
@@ -11,13 +11,13 @@ function cast(send, player, targetId, ballotKey = player.state.ballotKey) {
   return result;
 }
 
-function roomFixture(t, practice = true) {
+function roomFixture(t, practice = true, hostAi = null) {
   const sockets = new Map();
   const io = {
     sockets: { sockets },
     to: (id) => ({ emit: (...args) => sockets.get(id)?.emit(...args) }),
   };
-  const room = createRoom(io, "SAMPLE", "host-session", { night: 800, day: 1200 }, practice);
+  const room = createRoom(io, "SAMPLE", "host-session", { night: 800, day: 1200 }, practice, hostAi);
   t.after(() => room.dispose());
 
   function newSocket(id) {
@@ -240,7 +240,7 @@ test("every open practice tile stays manual across automatic bot timing", (t) =>
   t.mock.timers.tick(80);
   assert.equal(host.state.phase, "night");
   assert.ok(host.state.clock.overtimeUntil);
-  t.mock.timers.tick(10000);
+  for (const actor of [host, ...tiles.slice(3)]) pick(send, actor, { skip: true });
   assert.equal(host.state.phase, "day");
   assert.equal(host.state.clock, null);
 });
@@ -930,9 +930,36 @@ test("skipping and automatic voting never reveal a Mayor", (t) => {
   assert.equal(room.buildTableState().cues.filter(({ text }) => text.includes("revealed as Mayor")).length, 1);
 });
 
-test("practice bots answer members of the room and stay quiet under manual control", (t) => {
+test("practice bots stay silent without a key and still vote", (t) => {
   t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1000 });
   const { room, host, newSocket, send } = roomFixture(t);
+  const guest = newSocket("spectating-chat");
+  room.join(guest, "guest-session", "Friend");
+  for (let index = 0; index < 3; index++) send(host, "addBot");
+  send(host, "configureBotAi", { key: "mock-key-for-tests-only", remember: true }, (error) => assert.match(error, /own instance/));
+  assert.equal(host.state.me.hostAi, null);
+  send(host, "startGame");
+  send(host, "resolveNight");
+  send(guest, "discuss", { dayNumber: host.state.dayNumber, text: "Bot 1, whom do you suspect?" }, (error) => assert.equal(error, null));
+  t.mock.timers.tick(5000);
+  assert.equal(host.discussionUpdate.messages.length, 1);
+  assert.equal(room.buildTableState().discussion, undefined);
+  startVoting(send, host);
+  t.mock.timers.tick(600);
+  assert.equal(host.state.votesCast, 3);
+  assert.equal(host.state.geminiDiscussion, false);
+});
+
+test("AI bots answer a named player using aliases and use the model vote", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1000 });
+  const requests = [];
+  const { room, host, newSocket, send } = roomFixture(t, true, {
+    allowed: () => true,
+    create: () => ({ available: true, close() {}, async decide(context) {
+      requests.push(context);
+      return { voteTarget: context.replyTo, line: `Why do you suspect me, ${context.replyTo}?` };
+    } }),
+  });
   const guest = newSocket("discussion-guest");
   room.join(guest, "discussion-session", "Alex");
   for (let index = 1; index <= 3; index++) {
@@ -942,11 +969,14 @@ test("practice bots answer members of the room and stay quiet under manual contr
   const bot = newSocket("named-bot");
   assert.equal(room.joinBot(bot, host.state.bots[0].token), true);
   const { name } = bot.state.me;
+  send(host, "configureBotAi", { key: "mock-key-for-tests-only" }, (error) => assert.equal(error, null));
+  assert.equal(host.state.me.hostAi.configured, true);
+  assert.equal(guest.state.me.hostAi, null);
   send(host, "startGame");
   send(host, "resolveNight");
   let acknowledgement;
   const note = (player, text) => send(player, "discuss", { dayNumber: host.state.dayNumber, text }, (error) => { acknowledgement = error; });
-  note(guest, `I suspect ${name}. What are you thinking?`);
+  note(guest, `I suspect ${name}. Private text never leaves the server.`);
   assert.equal(acknowledgement, null);
   note(guest, "Too soon.");
   assert.match(acknowledgement, /moment/);
@@ -954,17 +984,64 @@ test("practice bots answer members of the room and stay quiet under manual contr
   assert.equal(host.discussionUpdate.messages.length, 1);
   send(bot, "setBotAuto", true);
   t.mock.timers.tick(1800);
+  await Promise.resolve();
   const reply = host.discussionUpdate.messages.at(-1);
   assert.equal(reply.name, name);
   assert.equal(reply.automated, true);
-  assert.match(reply.text, /Alex, what made you suspect me/);
+  assert.match(reply.text, /Why do you suspect me, Alex/);
+  assert.equal(requests[0].challenged, true);
+  assert.doesNotMatch(JSON.stringify(requests[0]), /Private text|Alex|Bot 1|mock-key/);
   assert.deepEqual(guest.discussionUpdate.messages.at(-1), reply);
   assert.equal(room.buildTableState().discussion, undefined);
+  assert.ok(requests[0].eligible.some(({ player }) => player === requests[0].replyTo));
+  startVoting(send, host);
+  t.mock.timers.tick(600);
+  assert.equal(bot.state.me.dayVoteTarget, id(guest));
   send(host, "forceSleep");
   note(guest, "Night message");
   assert.match(acknowledgement, /during the day/);
   t.mock.timers.tick(1800);
   assert.equal(host.discussionUpdate.messages.at(-1).id, reply.id);
+});
+
+test("host keys are room-scoped and survive a reload only when remembered", (t) => {
+  let created = 0;
+  let closed = 0;
+  const { room, host, newSocket, send } = roomFixture(t, true, {
+    allowed: (socket) => Boolean(socket && socket.id !== "unsafe"),
+    create: () => { created++; return { available: true, close() { closed++; } }; },
+  });
+  const guest = newSocket("guest");
+  room.join(guest, "guest-session", "Guest");
+  const key = "private-test-key-not-for-logs";
+  send(guest, "configureBotAi", { key }, (error) => assert.match(error, /own instance/));
+  assert.equal(created, 0);
+  send(host, "configureBotAi", { key, remember: false }, (error) => assert.equal(error, null));
+  assert.doesNotMatch(JSON.stringify([host.state, guest.state, room.buildTableState()]), /private-test-key/);
+  room.leave(host, false);
+  assert.equal(closed, 1);
+  const reloaded = newSocket("reloaded");
+  room.join(reloaded, "host-session", "Tester");
+  assert.equal(reloaded.state.me.hostAi.configured, false);
+  send(reloaded, "configureBotAi", { key, remember: true }, (error) => assert.equal(error, null));
+  room.leave(reloaded, false);
+  assert.equal(guest.state.geminiDiscussion, false);
+  const unsafe = newSocket("unsafe");
+  room.join(unsafe, "host-session", "Tester");
+  assert.equal(unsafe.state.me.hostAi, null);
+  assert.equal(guest.state.geminiDiscussion, false);
+  const remembered = newSocket("remembered");
+  room.join(remembered, "host-session", "Tester");
+  assert.equal(remembered.state.me.hostAi.remember, true);
+  assert.equal(guest.state.geminiDiscussion, true);
+  room.leave(remembered, true);
+  assert.equal(closed, 2);
+  assert.equal(guest.state.me.isHost, true);
+  assert.equal(guest.state.me.hostAi.configured, false);
+  send(guest, "configureBotAi", { key, remember: true }, (error) => assert.equal(error, null));
+  send(guest, "configureBotAi", { clear: true }, (error) => assert.equal(error, null));
+  assert.equal(closed, 3);
+  assert.equal(guest.state.me.hostAi.configured, false);
 });
 
 test("an idle Vampire gets negative overtime and an automatic choice", (t) => {
@@ -1014,22 +1091,29 @@ test("the Lookout waits for every other choice and gets its own overtime", (t) =
   assert.ok(lookout.state.me.privateMessages.some(({ text }) => text.includes("the attack shifted")));
 });
 
-test("Luna requests use low reasoning and public context, with a fallback on errors", async () => {
-  assert.equal(createLunaSpeaker(""), null);
-  const input = { speaker: "Bot 1", suggestedTarget: "Pat", fallback: "I’m leaning toward Pat.", messages: [{ name: "Alex", text: "Ask Pat." }] };
-  const speaker = createLunaSpeaker("mock-key", async (url, options) => {
-    assert.equal(url, "https://api.openai.com/v1/responses");
-    assert.equal(options.headers.Authorization, "Bearer mock-key");
-    const body = JSON.parse(options.body);
-    assert.equal(body.model, "gpt-6-luna");
-    assert.deepEqual(body.reasoning, { effort: "low" });
-    assert.equal(body.store, false);
-    assert.deepEqual(JSON.parse(body.input).discussion, input.messages);
-    return { ok: true, json: async () => ({ output: [
-      { type: "reasoning" }, { type: "message", role: "assistant", content: [{ type: "output_text", text: "  Pat, what did you notice?  " }] },
-    ] }) };
+test("Gemini uses the host key, low thinking, and an abortable request", async () => {
+  assert.equal(createGeminiBot(""), null);
+  const key = "test-only-key-sample";
+  const input = { speaker: "P1", eligible: [{ player: "P2", suspicion: 1 }] };
+  let requestOptions;
+  let requestUrl;
+  const bot = createGeminiBot(key, async (url, options) => {
+    requestUrl = url;
+    requestOptions = options;
+    return { ok: true, json: async () => ({ candidates: [{ content: { parts: [
+      { thought: true, text: "ignore" }, { text: '{"voteTarget":"P2","line":" P2, what did you notice? "}' },
+    ] } }] }) };
   });
-  assert.equal(await speaker(input), "Pat, what did you notice?");
-  const unavailable = createLunaSpeaker("mock-key", async () => ({ ok: false }));
-  assert.equal(await unavailable(input), null);
+  assert.deepEqual(await bot.decide(input), { voteTarget: "P2", line: "P2, what did you notice?" });
+  assert.match(requestUrl, /models\/gemini-4-hydrogen:generateContent$/);
+  assert.equal(requestOptions.headers["x-goog-api-key"], key);
+  const body = JSON.parse(requestOptions.body);
+  assert.equal(body.generationConfig.thinkingConfig.thinkingLevel, "LOW");
+  assert.deepEqual(JSON.parse(body.contents[0].parts[0].text), input);
+  bot.close();
+  assert.equal(requestOptions.signal.aborted, true);
+  assert.equal(await bot.decide(input), null);
+  const unavailable = createGeminiBot(key, async () => ({ ok: false }));
+  assert.equal(await unavailable.decide(input), null);
+  assert.equal(unavailable.available, false);
 });

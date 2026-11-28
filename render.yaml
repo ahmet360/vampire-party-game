@@ -7,5 +7,7 @@ services:
     startCommand: npm start
     healthCheckPath: /healthz
     envVars:
+      - key: BOT_AI_MODE
+        value: silent
       - key: SKIP_INSTALL_DEPS
         value: 'true'

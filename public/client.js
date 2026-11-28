@@ -18,6 +18,7 @@ let pendingMayorReveal = false;
 let savingTurn = false;
 let savingVote = false;
 let postingDiscussion = false;
+let savingHostAi = false;
 let roomMode = "create";
 let botDeskOpen = true;
 let boardOpen = false;
@@ -120,7 +121,7 @@ function renderDiscussion() {
   $("discussion-panel").classList.toggle("hidden", !open);
   if (!open) return;
 
-  $("discussion-provider").classList.toggle("hidden", !state.lunaDiscussion);
+  $("discussion-provider").classList.toggle("hidden", !state.geminiDiscussion);
   const messages = state.discussion || [];
   const log = $("discussion-log");
   const version = `${state.roomCode}:${messages.at(-1)?.id ?? "empty"}`;
@@ -162,6 +163,49 @@ $("discussion-form").addEventListener("submit", (event) => {
     renderDiscussion();
   });
 });
+
+function renderHostAi() {
+  const config = state?.me.hostAi;
+  $("host-ai-panel").classList.toggle("hidden", !config);
+  if (!config) {
+    $("host-ai-key").value = "";
+    return;
+  }
+
+  $("host-ai-status").textContent = !config.configured ? "Bots are silent and choose randomly until you add a key."
+    : !config.available ? "Gemini is unavailable. Bots are silent and choose randomly. Check your key and project quota."
+    : config.remember ? "Key added. This room keeps it when you reload."
+    : "Key added for this connection. Reloading or disconnecting clears it.";
+  const remember = $("host-ai-remember");
+  if (remember.dataset.saved !== String(config.remember)) {
+    remember.dataset.saved = String(config.remember);
+    remember.checked = config.remember;
+  }
+  $("host-ai-connect").disabled = savingHostAi;
+  $("host-ai-clear").disabled = savingHostAi;
+  $("host-ai-clear").classList.toggle("hidden", !config.configured);
+}
+
+function updateHostAi(payload) {
+  if (savingHostAi || !state?.me.hostAi) return;
+  if (!socket.connected) return showToast("Reconnecting. Try again in a moment.");
+  const roomCode = state.roomCode;
+  savingHostAi = true;
+  $("host-ai-key").value = "";
+  renderHostAi();
+  socket.timeout(6500).emit("configureBotAi", payload, (error, message) => {
+    if (state?.roomCode !== roomCode) return;
+    savingHostAi = false;
+    renderHostAi();
+    if (error || message) showToast(message || "Could not update bot AI. Check the status and try again.");
+  });
+}
+
+$("host-ai-form").addEventListener("submit", (event) => {
+  event.preventDefault();
+  updateHostAi({ key: $("host-ai-key").value, remember: $("host-ai-remember").checked });
+});
+$("host-ai-clear").addEventListener("click", () => updateHostAi({ clear: true }));
 
 // ##################################### 3
 // Join screen handling
@@ -306,8 +350,12 @@ $("leave-room-btn").addEventListener("click", () => socket.emit("leaveRoom"));
 
 function returnToRooms(message) {
   $("discussion-input").value = "";
+  $("host-ai-key").value = "";
+  $("host-ai-remember").checked = false;
+  delete $("host-ai-remember").dataset.saved;
   savingVote = false;
   postingDiscussion = false;
+  savingHostAi = false;
   if (isBotWindow) {
     connectBot = false;
     state = null;
@@ -394,6 +442,7 @@ function render() {
   $("top-player-list").innerHTML = renderPlayerList();
   $("app-status").innerHTML = `${renderBotControls()}${renderStatusCard()}${state.votingOpen ? renderActionCard() : ""}`;
   renderDiscussion();
+  renderHostAi();
   $("app").innerHTML = `
     ${renderRoleCard()}
     ${renderBotDesk()}
@@ -726,7 +775,7 @@ function renderBotControls() {
     <section class="card bot-controls" aria-label="Bot player controls">
       <div>
         <h2>${escapeHtml(state.me.name)}</h2>
-        <p class="muted">${state.me.botAuto ? "Discussing and playing automatically" : "You control this bot"} · Practice room</p>
+        <p class="muted">${state.me.botAuto ? "Playing automatically" : "You control this bot"} · Practice room</p>
       </div>
       <button type="button" id="toggle-bot-auto" class="secondary">${state.me.botAuto ? "Take control" : "Auto-play"}</button>
     </section>`;
@@ -1307,6 +1356,8 @@ socket.on("roomLeft", returnToRooms);
 socket.on("disconnect", () => {
   if (!state?.me) return;
   savingTurn = false;
+  savingHostAi = false;
+  $("host-ai-key").value = "";
   hidePrivateView();
   showToast("Connection lost. Reconnecting…");
 });

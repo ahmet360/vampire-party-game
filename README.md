@@ -25,7 +25,25 @@ The room creator hosts automatically. To use the table announcer, open the room�
 
 Check **Practice room** when creating a room. Use **Add bot** for individual seats or **Set up all 15 roles** to deal one of each role, fill the empty seats and open the tiled practice board. You can also open the board with **Tile bot views**. Open bot views start in manual mode. Select **Auto-play** on any bot you want to hand over to the game. Bots without an open view play automatically. During an open night, taking control of a bot lets you replace its automatic choice before the shared deadline.
 
-During the day, use **Player discussion** to send text to the room. Automatic practice bots can discuss their suspicions, answer when named, and use those opinions when they vote. To use GPT-6 Luna on Low reasoning for dialogue, configure the OpenAI API key as the server's `OPENAI_API_KEY` environment variable. Only public discussion context goes to the model. The built-in bot replies work without a key and cover errors, timeouts, and server-wide request limits. The server limits Luna to 100 requests per UTC day per running instance and two concurrent requests.
+During the day, use **Player discussion** to send text to the room. Automatic practice bots in the public game stay silent and make random legal choices. Player chat works in both modes.
+
+## Self-hosting
+
+You can run your own copy for practice with **Gemini 4 Hydrogen**. Clone or download this repository. In its folder, install Node.js 24, run `npm ci --omit=dev --ignore-scripts`, then run `npm run setup-voice`. Start the server with `BOT_AI_MODE=host-owned`. In PowerShell, run the following.
+
+```powershell
+$env:BOT_AI_MODE = 'host-owned'
+$env:HOST = '127.0.0.1'
+npm start
+```
+
+On macOS or Linux, run `BOT_AI_MODE=host-owned HOST=127.0.0.1 npm start`.
+
+Open `http://127.0.0.1:3000`, create a **Practice room**, and add your own Gemini API key under **Gemini bot setup**. The key is kept in server memory for that room and never sent to guests. The default clears it when the host disconnects. **Keep the key when I reload this room** lets the same browser tab resume it with the same host seat. **Forget key**, leaving the room, host transfer, room expiry, and server restart clear it. With no usable key, the game continues with silent bots and random choices.
+
+To play with other devices and enter a key remotely, serve the instance through HTTPS. Set `PUBLIC_ORIGIN` to its exact HTTPS origin and have the TLS proxy preserve the `Host` header and set `X-Forwarded-Proto: https`. Keep the Node listener behind that proxy. A personal Render deployment can use Render’s provided URL and set `BOT_AI_MODE=host-owned` in its environment. The public portfolio deployment uses `BOT_AI_MODE=silent` and has no key entry.
+
+Gemini receives temporary player aliases, publicly revealed roles, and counts of in-game signals such as accusations. The game translates replies back to player names locally and lets bots use a valid suggested target when voting. It keeps raw chat and hidden roles on the instance. Use an eligible Google project that follows [Google’s age, region, and billing terms](https://aistudio.google.com/docs/terms). Bringing your own key uses your project’s quota and does not change its regional terms.
 
 ## Defining a role’s win
 

@@ -1,5 +1,5 @@
 const { randomInt, randomUUID } = require("node:crypto");
-const { formOpinion, mentionsPlayer, writeDiscussionLine } = require("./bot-discussion");
+const { mentionsPlayer, prepareBotDiscussion } = require("./bot-discussion");
 
 const ROLE_ORDER = [
   "Vampire",
@@ -92,7 +92,7 @@ function makeDefaultRoleConfig() {
   return config;
 }
 
-function createRoom(io, code, hostSession, timing, practice = false, speakWithLuna = null) {
+function createRoom(io, code, hostSession, timing, practice = false, hostAi = null) {
   const players = new Map();
   const socketToPlayerId = new Map();
   const tableSession = randomUUID();
@@ -104,6 +104,7 @@ function createRoom(io, code, hostSession, timing, practice = false, speakWithLu
   let botClock;
   let discussionTimer;
   let pendingDiscussion;
+  let botAi = null;
   let messageId = 0;
   let nextBotNumber = 1;
   let emptySince = Date.now();
@@ -274,13 +275,25 @@ function createRoom(io, code, hostSession, timing, practice = false, speakWithLu
     }
   }
 
-  function botPerspective(bot) {
-    const onVampireTeam = roleOutcome(bot.role).winner === "Vampires";
+  function aiVoteOptions(bot) {
     const eligible = getAlivePlayers().filter((player) => canVoteFor(bot, player.id));
     const nonAllies = eligible.filter((player) => bot.role !== "Vampire" || roleOutcome(player.role).winner !== "Vampires");
-    const candidates = (nonAllies.length ? nonAllies : eligible).map(({ id, name, publicRole }) => ({ id, name, publicRole }));
-    const perspective = { id: bot.id, name: bot.name, onVampireTeam, preferredTargets: bot.role === "Usurper" ? bot.usurperMarks : [] };
-    return { perspective, opinion: formOpinion(perspective, candidates, game.discussion) };
+    const candidates = nonAllies.length ? nonAllies : eligible;
+    const marks = candidates.filter(({ id }) => bot.role === "Usurper" && bot.usurperMarks.includes(id));
+    return marks.length ? marks : candidates;
+  }
+
+  function currentBotAi() {
+    if (!botAi || botAi.ownerSession !== hostSession) return null;
+    const owner = getAllPlayers().find((player) => player.isHost && player.connected && player.sessionId === hostSession);
+    return owner && hostAi.allowed(io.sockets.sockets.get(owner.socketId)) ? botAi : null;
+  }
+
+  function clearBotAi() {
+    botAi?.provider.close();
+    botAi = null;
+    pendingDiscussion = null;
+    game.botConversation?.opinions.clear();
   }
 
   function nextBotSpeaker() {
@@ -302,17 +315,18 @@ function createRoom(io, code, hostSession, timing, practice = false, speakWithLu
   }
 
   function scheduleBotDiscussion() {
-    if (game.phase !== "day" || emptySince !== null) {
+    if (game.phase !== "day" || emptySince !== null || !currentBotAi()?.provider.available) {
       clearTimeout(discussionTimer);
       discussionTimer = null;
       return;
     }
-    if (discussionTimer || pendingDiscussion === game.botConversation || !nextBotSpeaker()) return;
+    if (discussionTimer || pendingDiscussion?.conversation === game.botConversation || !nextBotSpeaker()) return;
 
     const conversation = game.botConversation;
     discussionTimer = setTimeout(() => {
       discussionTimer = null;
-      const next = game.botConversation === conversation && nextBotSpeaker();
+      const connection = currentBotAi();
+      const next = connection?.provider.available && game.botConversation === conversation && nextBotSpeaker();
       if (!next) return;
       const { bot, reply } = next;
       if (reply) {
@@ -322,19 +336,24 @@ function createRoom(io, code, hostSession, timing, practice = false, speakWithLu
         conversation.opened.add(bot.id);
       }
       conversation.lines += 1;
-      const { perspective, opinion } = botPerspective(bot);
-      const fallback = writeDiscussionLine(perspective, opinion, game.dayNumber, reply);
-      const publish = (text) => {
-        if (pendingDiscussion === conversation) pendingDiscussion = null;
-        if (game.botConversation !== conversation || game.phase !== "day" || emptySince !== null) return;
-        if (canAct(bot) && isAutomaticBot(bot)) appendDiscussion(bot, text || fallback, true);
-        scheduleBotDiscussion();
+      const move = prepareBotDiscussion({
+        bot, roster: getAllPlayers(), candidates: aiVoteOptions(bot), messages: game.discussion, day: game.dayNumber, reply,
+      });
+      const request = { conversation };
+      pendingDiscussion = request;
+      const publish = (decision) => {
+        if (pendingDiscussion !== request) return;
+        pendingDiscussion = null;
+        if (game.botConversation !== conversation || game.phase !== "day" || currentBotAi() !== connection) return;
+        if (decision && canAct(bot) && isAutomaticBot(bot)) {
+          const { targetId, text } = move.readDecision(decision);
+          if (targetId) conversation.opinions.set(bot.id, targetId);
+          if (text) appendDiscussion(bot, text, true);
+        }
+        if (!connection.provider.available) emitAll();
+        else scheduleBotDiscussion();
       };
-      if (speakWithLuna) {
-        pendingDiscussion = conversation;
-        const messages = game.discussion.slice(-8).map(({ name, text }) => ({ name, text }));
-        speakWithLuna({ speaker: bot.name, suggestedTarget: opinion?.player.name, fallback, messages }).then(publish, () => publish(null));
-      } else publish(null);
+      connection.provider.decide(move.context).then(publish, () => publish(null));
     }, 1800);
   }
 
@@ -348,7 +367,7 @@ function createRoom(io, code, hostSession, timing, practice = false, speakWithLu
       clock: game.clock,
       timing,
       practice,
-      lunaDiscussion: practice && Boolean(speakWithLuna),
+      geminiDiscussion: Boolean(currentBotAi()?.provider.available),
       phase: game.phase,
       hasStarted: game.hasStarted,
       dayNumber: game.dayNumber,
@@ -403,6 +422,9 @@ function createRoom(io, code, hostSession, timing, practice = false, speakWithLu
             connected: me.connected,
             alive: me.alive,
             isHost: me.isHost,
+            hostAi: me.isHost && practice && hostAi?.allowed(io.sockets.sockets.get(me.socketId)) ? {
+              configured: Boolean(botAi), available: Boolean(botAi?.provider.available), remember: Boolean(botAi?.remember),
+            } : null,
             isBot: Boolean(me.isBot),
             botAuto: Boolean(me.botAuto),
             role: me.role,
@@ -460,6 +482,7 @@ function createRoom(io, code, hostSession, timing, practice = false, speakWithLu
 
   function detachPlayerSocket(player, message) {
     if (!player.socketId) return;
+    if (botAi && botAi.ownerSession === player.sessionId && !botAi.remember) clearBotAi();
     socketToPlayerId.delete(player.socketId);
     const previousSocket = io.sockets.sockets.get(player.socketId);
     player.socketId = null;
@@ -542,6 +565,7 @@ function createRoom(io, code, hostSession, timing, practice = false, speakWithLu
     if (candidates.some((candidate) => candidate.isHost && candidate.connected)) return;
     const successor = candidates.find((candidate) => candidate.connected && !candidate.isBot);
     if (!successor) return;
+    clearBotAi();
     for (const candidate of candidates) candidate.isHost = candidate === successor;
     hostSession = successor.sessionId;
     if (practice) rotateBotAccess();
@@ -563,6 +587,8 @@ function createRoom(io, code, hostSession, timing, practice = false, speakWithLu
     const player = getPlayer(playerId);
     socketToPlayerId.delete(socket.id);
     if (!player) return;
+
+    if (botAi && botAi.ownerSession === player.sessionId && (transferHost || !botAi.remember)) clearBotAi();
 
     player.socketId = null;
     if (player.isBot) {
@@ -657,8 +683,10 @@ function createRoom(io, code, hostSession, timing, practice = false, speakWithLu
           submitNightAction(bot, { ...automaticNightChoice(bot), nightKey: game.nightKey }, true);
           emitPlayer(bot);
         } else {
-          const { opinion } = botPerspective(bot);
-          submitVote(bot, opinion?.player.id ?? null);
+          const opinion = currentBotAi()?.provider.available ? game.botConversation?.opinions.get(bot.id) : null;
+          const targetId = opinion && canVoteFor(bot, opinion) ? opinion : chooseTarget(getAlivePlayers()
+            .filter((player) => canVoteFor(bot, player.id))).targetId;
+          submitVote(bot, targetId ?? null);
         }
       }
       if (atNight) {
@@ -1132,7 +1160,7 @@ function createRoom(io, code, hostSession, timing, practice = false, speakWithLu
     game.phase = "day";
     game.dayNumber += 1;
     game.dayVotes = {};
-    game.botConversation = { opened: new Set(), responded: new Set(), lines: 0, lastReply: 0 };
+    game.botConversation = { opened: new Set(), responded: new Set(), opinions: new Map(), lines: 0, lastReply: 0 };
     const discussion = `Day ${game.dayNumber}. Discuss what happened. The host will open voting when you’re ready.`;
     pushMessage(discussion);
     announceToTable(discussion);
@@ -1380,6 +1408,26 @@ function createRoom(io, code, hostSession, timing, practice = false, speakWithLu
   }
 
   const handlers = {
+    configureBotAi(socket, payload, acknowledge) {
+      let error = null;
+      if (!practice || !isHostSocket(socket) || !hostAi?.allowed(socket)) {
+        error = "AI bot setup is available to the host on their own instance over HTTPS or localhost.";
+      } else if (payload?.clear === true) {
+        clearBotAi();
+        emitAll();
+      } else {
+        const key = typeof payload?.key === "string" ? payload.key.trim() : "";
+        const provider = hostAi.create(key);
+        if (!provider) error = "Enter a Gemini API key from Google AI Studio.";
+        else {
+          clearBotAi();
+          botAi = { provider, ownerSession: hostSession, remember: payload.remember === true };
+          emitAll();
+        }
+      }
+      if (typeof acknowledge === "function") acknowledge(error);
+    },
+
     addBot(socket) {
       if (!practice || !isHostSocket(socket) || game.phase !== "lobby") return;
       if (players.size >= MAX_PLAYERS) return sendError(socket, "This room is full.");
@@ -1641,6 +1689,7 @@ function createRoom(io, code, hostSession, timing, practice = false, speakWithLu
       clearTimeout(hostTimer);
       clearTimeout(botTimer);
       clearTimeout(discussionTimer);
+      clearBotAi();
       game.botConversation = null;
       if (practice) {
         for (const bot of players.values()) {

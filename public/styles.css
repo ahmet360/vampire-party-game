@@ -708,6 +708,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .discussion-message p { margin: 3px 0 0; }
 .discussion-form { display: flex; align-items: stretch; gap: 8px; margin-top: 10px; }
 .discussion-form input { min-width: 0; flex: 1; }
+#host-ai-form { display: grid; gap: 10px; margin-bottom: 12px; }
 .action-card .night-options, .private-box .night-options { justify-content: flex-start; }
 .private-box > button, .private-box .target-grid, .role-card > button + button { margin-top: 8px; }
 .private-roster { margin: 0; padding-left: 20px; }
